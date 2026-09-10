@@ -533,3 +533,6 @@ zapret-test/
 An HTTP 3xx/403 response is not, by itself, proof of blocking or full application functionality. Successful DNS/TCP/TLS checks also do not prove that an entire application workflow works.
 
 Blockcheck candidates are experimental evidence. Unknown strategies must not be treated as working solely because an external command returned successfully.
+
+
+License - MIT
