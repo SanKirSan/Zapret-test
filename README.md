@@ -323,8 +323,6 @@ The `curl` equivalent is:
 curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh | sh
 ```
 
-Replace `OWNER/REPOSITORY` with the actual GitHub repository path. `bootstrap.sh` downloads the source tar.gz archive and invokes the normal `install.sh`; OpenWrt does not need `unzip` for this bootstrap path.
-
 `zapret-test` is a CLI diagnostic harness for OpenWrt/Linux. It tests service reachability, DNS, HTTP/HTTPS, blockcheck/blockcheck2 and candidate `zapret`/`zapret2` strategies.
 
 The tool **does not rewrite the installed zapret/zapret2 configuration without an explicit user action**. Experimental checks use isolated test state and perform rollback afterwards.
