@@ -298,6 +298,7 @@ zapret-test/
 
 ### Источники доменных списков
 
+См. [репозиторий itdoginfo/allow-domains](https://github.com/itdoginfo/allow-domains).
 
 ---
 
