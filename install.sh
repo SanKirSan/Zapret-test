@@ -311,3 +311,11 @@ echo "Installed $NAME $VERSION"
 echo "Binary : $BIN"
 echo "Config : $ETC"
 echo "Run    : $NAME"
+printf '\n'
+printf '%s\n' '============================================================'
+printf '%s\n' "                     ZAPRET-TEST $VERSION"
+printf '%s\n' '============================================================'
+printf '\n'
+printf '%s' 'Введите для начала работы с программой zapret-test: '
+read _
+printf '\n'
