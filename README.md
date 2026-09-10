@@ -19,19 +19,19 @@
 Для Bash/Zsh:
 
 ```sh
-sh <(wget -O - https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh)
+sh <(wget -O - https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh)
 ```
 
 Для OpenWrt/BusyBox `ash` используйте POSIX-вариант без process substitution:
 
 ```sh
-wget -O - https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh | sh
+wget -O - https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh | sh
 ```
 
 То же через `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh | sh
 ```
 
 Вместо `OWNER/REPOSITORY` укажите фактический GitHub-путь проекта. `bootstrap.sh` скачивает исходный tar.gz-архив и запускает обычный `install.sh`; на OpenWrt это не требует `unzip`.
