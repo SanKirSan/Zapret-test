@@ -1,0 +1,10 @@
+YouTube
+Discord
+Telegram
+Google
+Instagram
+TikTok
+VK
+Reddit
+Twitch
+Steam

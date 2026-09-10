@@ -1,0 +1,3797 @@
+#!/bin/sh
+# zapret-test - OpenWrt diagnostic harness for zapret/zapret2
+# POSIX/BusyBox ash compatible. Does not vendor upstream code.
+
+set -u
+
+NAME="zapret-test"
+VERSION="0.6.6.6"
+RELEASE_DATE="2026-09-10"
+ETC="${ZAPRET_TEST_ETC:-/etc/zapret-test}"
+RUN="${ZAPRET_TEST_RUN:-/tmp/zapret-test}"
+BACKUP="$RUN/backup"
+DEBUGDIR="$RUN/debug"
+BLOCKDIR="$RUN/blockcheck"
+REPORT_TXT="/tmp/rezult_zapret.txt"
+REPORT_JSON="/tmp/rezult_zapret.json"
+BEST_Z="/tmp/zapret-best.conf"
+BEST_Z2="/tmp/zapret2-best.conf"
+CONFIG="$ETC/config"
+SERVICES="$ETC/services.conf"
+CUSTOM_SERVICES="$ETC/custom-services.conf"
+DOMAIN_LIST_DIR="$ETC/lists"
+DOMAIN_SOURCES="$ETC/domain-sources.conf"
+SERVICE_DB="$SERVICES"
+CONTROL="$ETC/control.list"
+PROFILES="$ETC/profiles"
+CUSTOM_STRATEGIES="$ETC/strategies/custom"
+BUNDLED="$ETC/bundled"
+COMPATDIR="$ETC/compat"
+REQ_FILE="$ETC/requirements.conf"
+REQ_STATE_DIR="$RUN/requirements"
+STATE="$RUN/state"
+PIDFILE="$RUN/pid"
+QNUM="$(( $$ % 64536 + 1000 ))"
+NFT_TABLE="zaprettest_$$"
+IPT_CHAIN="ZAPRETTEST_$$"
+ORIG_SERVICE=0
+ZAPRET_WAS_ACTIVE=0
+ZAPRET2_WAS_ACTIVE=0
+CURRENT_ENGINE=""
+CURRENT_STRATEGY=""
+FWTYPE="unknown"
+FW="unknown"
+USER_AGENT="Mozilla/5.0"
+CURL=""
+OPENSSL=""
+CURRENT_ARGS=""
+ROLLBACK_OK=1
+NFQWS=""
+TPWS=""
+NFQWS2=""
+BLOCKCHECK=""
+BLOCKCHECK2=""
+TEST_CLIENT="${TEST_CLIENT:-curl}"
+TIMEOUT="${TIMEOUT:-10}"
+# blockcheck2 upstream defaults to 2s; keep its probe timeout independent from generic diagnostics.
+BLOCKCHECK_CURL_MAX_TIME="${BLOCKCHECK_CURL_MAX_TIME:-2}"
+BLOCKCHECK_CURL_MAX_TIME_QUIC="${BLOCKCHECK_CURL_MAX_TIME_QUIC:-$BLOCKCHECK_CURL_MAX_TIME}"
+BLOCKCHECK_TIMEOUT="${BLOCKCHECK_TIMEOUT:-0}"
+WAIT_AFTER_RESTART="${WAIT_AFTER_RESTART:-3}"
+BLOCKCHECK_SCANLEVEL="${BLOCKCHECK_SCANLEVEL:-standard}"
+BLOCKCHECK_OUTPUT_MODE="${BLOCKCHECK_OUTPUT_MODE:-summary}" # summary|raw
+ENABLE_HTTP3="${ENABLE_HTTP3:-1}"
+ENABLE_UDP="${ENABLE_UDP:-1}"
+BLOCKCHECK_RUNNING_PID=""
+BLOCKCHECK_RUNNING_ENGINE=""
+BLOCKCHECK_RUNNING_LOG=""
+EXTERNAL_DIR="$RUN/external"
+EXTERNAL_RUNNING_PID=""
+EXTERNAL_RUNNING_LOG=""
+EXTERNAL_RUNNING_PGID=""
+EXTERNAL_RUNNING_ISOLATED=0
+EXTERNAL_TIMEOUT="${EXTERNAL_TIMEOUT:-300}"
+EXTERNAL_ALLOW_REMOTE_SCRIPTS="${EXTERNAL_ALLOW_REMOTE_SCRIPTS:-1}"
+EXTERNAL_CENSORCHECK_URL="${EXTERNAL_CENSORCHECK_URL:-https://github.com/vernette/censorcheck/raw/master/censorcheck.sh}"
+EXTERNAL_RU_IPERF_URL="${EXTERNAL_RU_IPERF_URL:-https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh}"
+EXTERNAL_IPCHECKPLACE_URL="${EXTERNAL_IPCHECKPLACE_URL:-https://IP.Check.Place}"
+EXTERNAL_CHECKPLACE_URL="${EXTERNAL_CHECKPLACE_URL:-https://Check.Place}"
+LANG_MODE="${ZAPRET_TEST_LANG:-RU}"
+
+umask 077
+if [ -d "$COMPATDIR" ]; then PATH="$COMPATDIR:$PATH"; export PATH; fi
+
+say() { printf '%s\n' "$*"; }
+log() { printf '%s %s\n' "[$(date '+%F %T')]" "$*" >> "$RUN/run.log"; }
+die() { say "ERROR: $*" >&2; exit 1; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# ANSI colors are used only when stdout is a TTY and NO_COLOR is not set.
+COLOR_ENABLED=0
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then COLOR_ENABLED=1; fi
+C_RESET= C_BOLD= C_DIM= C_CYAN= C_GREEN= C_YELLOW= C_RED= C_BG_GREEN= C_BG_YELLOW= C_BG_RED= C_FG_BLACK= C_FG_WHITE=
+if [ "$COLOR_ENABLED" = 1 ]; then
+    C_RESET=$(printf '\033[0m')
+    C_BOLD=$(printf '\033[1m')
+    C_DIM=$(printf '\033[2m')
+    C_CYAN=$(printf '\033[36m')
+    C_GREEN=$(printf '\033[32m')
+    C_YELLOW=$(printf '\033[33m')
+    C_RED=$(printf '\033[31m')
+    C_BG_GREEN=$(printf '\033[42m')
+    C_BG_YELLOW=$(printf '\033[43m')
+    C_BG_RED=$(printf '\033[41m')
+    C_FG_BLACK=$(printf '\033[30m')
+    C_FG_WHITE=$(printf '\033[97m')
+fi
+colorize() { color="$1"; text="$2"; printf '%s%s%s' "$color" "$text" "$C_RESET"; }
+badge() {
+    _bg="$1"; _fg="$2"; _text="$3"
+    [ "$COLOR_ENABLED" = 1 ] && printf '%s%s%s %s %s%s' "$_bg" "$_fg" "$C_BOLD" "$_text" "$C_RESET" "" || printf '[ %s ]' "$_text"
+}
+
+# UI language: Y = Russian, N = English. Technical values/status codes remain unchanged.
+choose_language() {
+    [ "${ZAPRET_TEST_LANG_PROMPT:-1}" = 0 ] && return 0
+    t LANG_PROMPT; printf ' '
+    read lang_answer || lang_answer=y
+    case "$lang_answer" in
+        n|N) LANG_MODE=EN ;;
+        *) LANG_MODE=RU ;;
+    esac
+    export LANG_MODE
+}
+
+t() {
+    key="$1"
+    case "${LANG_MODE:-RU}:$key" in
+        RU:MAIN_SYSTEM) echo 'СИСТЕМА' ;; EN:MAIN_SYSTEM) echo 'SYSTEM' ;;
+        RU:MAIN_COMPONENTS) echo 'КОМПОНЕНТЫ' ;; EN:MAIN_COMPONENTS) echo 'COMPONENTS' ;;
+        RU:TEST_ENGINE) echo 'Движок теста' ;; EN:TEST_ENGINE) echo 'Test engine' ;;
+        RU:QUICK) echo 'Быстрый тест' ;; EN:QUICK) echo 'Quick test' ;;
+        RU:FULL) echo 'Полный тест' ;; EN:FULL) echo 'Full test' ;;
+        RU:AUTO) echo 'Автоматический тест' ;; EN:AUTO) echo 'Automatic test' ;;
+        RU:BASELINE) echo 'Только базовая проверка' ;; EN:BASELINE) echo 'Baseline only' ;;
+        RU:PROFILE) echo 'Выбор сервиса / доменов' ;; EN:PROFILE) echo 'Select service / domains' ;;
+        RU:ENGINE) echo 'Выбор движка' ;; EN:ENGINE) echo 'Select engine' ;;
+        RU:BC1) echo 'Запустить blockcheck (zapret)' ;; EN:BC1) echo 'Run blockcheck (zapret)' ;;
+        RU:BC2) echo 'Запустить blockcheck2 (zapret2)' ;; EN:BC2) echo 'Run blockcheck2 (zapret2)' ;;
+        RU:BCBOTH) echo 'Запустить blockcheck + blockcheck2' ;; EN:BCBOTH) echo 'Run blockcheck + blockcheck2' ;;
+        RU:AVAIL_MENU) echo 'Диагностика доступности / сети' ;; EN:AVAIL_MENU) echo 'Availability / network diagnostics' ;;
+        RU:CUSTOM) echo 'Добавить свой сервис' ;; EN:CUSTOM) echo 'Add custom service' ;;
+        RU:REQ) echo 'Зависимости пакетов' ;; EN:REQ) echo 'Package requirements' ;;
+        RU:DETECT) echo 'Определение системы' ;; EN:DETECT) echo 'Detection / system info' ;;
+        RU:RESTORE) echo 'Восстановить состояние теста' ;; EN:RESTORE) echo 'Restore test state' ;;
+        RU:REPORT) echo 'Показать последний отчёт' ;; EN:REPORT) echo 'Show last report' ;;
+        RU:DEBUG) echo 'Расширенная диагностика' ;; EN:DEBUG) echo 'Extended diagnostics' ;;
+        RU:EXIT) echo 'Выход' ;; EN:EXIT) echo 'Exit' ;;
+        RU:FULL_AVAIL) echo 'Полный набор тестов' ;; EN:FULL_AVAIL) echo 'Full test suite' ;;
+        RU:IPREGION) echo 'IP / Регион' ;; EN:IPREGION) echo 'IP / Region' ;;
+        RU:DPI) echo 'Censorcheck-like — DPI' ;; EN:DPI) echo 'Censorcheck-like — DPI' ;;
+        RU:GEOBLOCK) echo 'Censorcheck-like — GeoBlock' ;; EN:GEOBLOCK) echo 'Censorcheck-like — GeoBlock' ;;
+        RU:IPERF) echo 'Российский iPerf3' ;; EN:IPERF) echo 'Russian iPerf3' ;;
+        RU:IPERF_ALT) echo 'Другие iPerf3-серверы' ;; EN:IPERF_ALT) echo 'Alternative iPerf3 servers' ;;
+        RU:PING) echo 'Проверка Ping / сетевой доступности' ;; EN:PING) echo 'Ping / network reachability' ;;
+        RU:IPQUALITY) echo 'IP Quality / Reputation' ;; EN:IPQUALITY) echo 'IP Quality / Reputation' ;;
+        RU:HTTPDNS) echo 'HTTP/HTTPS + целостность DNS' ;; EN:HTTPDNS) echo 'HTTP/HTTPS + DNS integrity' ;;
+        RU:LOGS) echo 'Сохранённые отчёты тестов' ;; EN:LOGS) echo 'View saved test logs' ;;
+        RU:RESULTS) echo 'Сводка результатов availability' ;; EN:RESULTS) echo 'Availability result summary' ;;
+        RU:NVIDIA_DETAIL) echo 'NVIDIA — подробная диагностика' ;; EN:NVIDIA_DETAIL) echo 'NVIDIA — detailed diagnostics' ;;
+        RU:IPERF_MODE) echo 'IPv4, TCP-порты iPerf3, короткий тест пропускной способности' ;; EN:IPERF_MODE) echo 'IPv4, iPerf3 TCP ports, short throughput test' ;;
+        RU:BACK) echo 'Назад' ;; EN:BACK) echo 'Back' ;;
+        RU:SELECT) printf '%s' 'Выбор: ' ;; EN:SELECT) printf '%s' 'Select: ' ;;
+        RU:PRESS_ENTER) printf '%s' 'Нажмите Enter для продолжения... ' ;; EN:PRESS_ENTER) printf '%s' 'Press Enter to continue... ' ;;
+        RU:LANG_PROMPT) printf '%s' 'Использовать русский язык интерфейса? [Y/n]:' ;; EN:LANG_PROMPT) printf '%s' 'Use Russian interface? [Y/n]:' ;;
+        RU:KEYWORD_INFO) echo 'Перед вводом ключевого слова: поиск выполняется по Certificate Transparency (crt.sh), результаты очищаются от дублей, а для известных сервисов добавляются локальные домены.' ;; EN:KEYWORD_INFO) echo 'Before entering a keyword: discovery uses Certificate Transparency (crt.sh), removes duplicates, and supplements known services with local domains.' ;;
+        RU:KEYWORD_PROMPT) printf '%s' 'Ключевое слово (например nvidia): ' ;; EN:KEYWORD_PROMPT) printf '%s' 'Keyword (e.g. nvidia): ' ;;
+        RU:KEYWORD_SEARCH) echo 'Поиск доменов по ключевому слову' ;; EN:KEYWORD_SEARCH) echo 'Domain keyword search' ;;
+        RU:KEYWORD_FOUND) printf '%s' 'Найдено доменов: ' ;; EN:KEYWORD_FOUND) printf '%s' 'Domains found: ' ;;
+        RU:KEYWORD_NORESULTS) echo 'Домены по этому ключевому слову не найдены.' ;; EN:KEYWORD_NORESULTS) echo 'No domains found for this keyword.' ;;
+        RU:KEYWORD_TOO_SHORT) echo 'Ключевое слово должно содержать минимум 3 символа.' ;; EN:KEYWORD_TOO_SHORT) echo 'Keyword must contain at least 3 characters.' ;;
+        RU:KEYWORD_NOTE) echo 'Важно: Certificate Transparency не является полным реестром рабочих сервисов. Перед тестом домены проходят DNS-фильтрацию.' ;; EN:KEYWORD_NOTE) echo 'Note: Certificate Transparency is not a complete inventory of active services. Domains are DNS-filtered before testing.' ;;
+        RU:SELECT_PROFILE) echo 'ВЫБОР ПРОФИЛЯ' ;; EN:SELECT_PROFILE) echo 'SELECT PROFILE' ;;
+        RU:CUSTOM_SELECTION) echo '[C] Поиск по ключевому слову' ;; EN:CUSTOM_SELECTION) echo '[C] Search by keyword' ;;
+        RU:GROUPS) echo 'Группы' ;; EN:GROUPS) echo 'Groups' ;;
+        RU:APP) echo 'NVIDIA App' ;; EN:APP) echo 'NVIDIA App' ;;
+        RU:DRIVERS) echo 'Drivers' ;; EN:DRIVERS) echo 'Drivers' ;;
+        RU:AUTH) echo 'Authentication' ;; EN:AUTH) echo 'Authentication' ;;
+        RU:TELEMETRY) echo 'Telemetry / Analytics' ;; EN:TELEMETRY) echo 'Telemetry / Analytics' ;;
+        RU:CDN) echo 'CDN / Content' ;; EN:CDN) echo 'CDN / Content' ;;
+        RU:DNS) echo 'DNS' ;; EN:DNS) echo 'DNS' ;;
+        RU:TCP) echo 'TCP 443' ;; EN:TCP) echo 'TCP 443' ;;
+        RU:TLS) echo 'TLS' ;; EN:TLS) echo 'TLS' ;;
+        RU:HTTPS) echo 'HTTPS' ;; EN:HTTPS) echo 'HTTPS' ;;
+        RU:ACCESS) echo 'Доступен' ;; EN:ACCESS) echo 'Available' ;;
+        RU:SERVICES) echo 'Сервисы' ;; EN:SERVICES) echo 'Services' ;;
+        RU:RUNNING) echo 'Идёт тестирование' ;; EN:RUNNING) echo 'Testing in progress' ;;
+        RU:PREPARE_BASELINE) echo 'Подготовка тестирования' ;; EN:PREPARE_BASELINE) echo 'Preparing test' ;;
+        RU:NO_DATA_VIEW) echo 'Нет данных для отображения.' ;; EN:NO_DATA_VIEW) echo 'No data to display.' ;;
+        RU:INVALID_SELECTION) echo 'Неверный выбор.' ;; EN:INVALID_SELECTION) echo 'Invalid selection.' ;;
+        RU:NO_SERVICES) echo 'Сервисы не выбраны.' ;; EN:NO_SERVICES) echo 'No services selected.' ;;
+        RU:DOMAIN_INVALID_LIST) echo 'Некорректные:' ;; EN:DOMAIN_INVALID_LIST) echo 'Invalid domains:' ;;
+        RU:DOMAIN_RETRY) echo 'Попробуй ещё раз или введи 0 для отмены.' ;; EN:DOMAIN_RETRY) echo 'Try again or enter 0 to cancel.' ;;
+        RU:EDIT_DOMAIN_ERROR) echo 'Некорректные домены. Исправь их или нажми Enter для сохранения старых.' ;; EN:EDIT_DOMAIN_ERROR) echo 'Invalid domains. Fix them or press Enter to keep the old values.' ;;
+        RU:EDITED) echo 'Изменён сервис' ;; EN:EDITED) echo 'Service updated' ;;
+        RU:DELETED) echo 'Удалён сервис' ;; EN:DELETED) echo 'Service deleted' ;;
+        RU:DELETE_CANCEL) echo 'Удаление отменено.' ;; EN:DELETE_CANCEL) echo 'Deletion cancelled.' ;;
+        RU:DELETE_CONFIRM) printf '%s' 'Удалить сервис "%s"? [y/N] ' ;; EN:DELETE_CONFIRM) printf '%s' 'Delete service "%s"? [y/N] ' ;;
+        RU:EDIT_SELECTED) echo '[1..N] Редактировать выбранный сервис' ;; EN:EDIT_SELECTED) echo '[1..N] Edit selected service' ;;
+        RU:EDIT_NUMBER) echo '[E] Редактировать (номер будет запрошен)' ;; EN:EDIT_NUMBER) echo '[E] Edit (prompt for number)' ;;
+        RU:DELETE_NUMBER) echo '[D] Удалить (номер будет запрошен)' ;; EN:DELETE_NUMBER) echo '[D] Delete (prompt for number)' ;;
+        RU:NO_VALID_BC_DOMAINS) echo 'У сервиса нет валидных доменов для blockcheck.' ;; EN:NO_VALID_BC_DOMAINS) echo 'Service has no valid blockcheck domains.' ;;
+        RU:AUTO_TARGET) printf '%s' 'Автоматический target: ' ;; EN:AUTO_TARGET) printf '%s' 'Automatic target: ' ;;
+        RU:TOTAL_DOMAINS) printf '%s' 'Всего доменов: %s | Доступны: %s | Недоступны: %s | Без полного результата: %s' ;; EN:TOTAL_DOMAINS) printf '%s' 'Total domains: %s | Available: %s | Unavailable: %s | Incomplete: %s' ;;
+        RU:DNS_TRANSPORT) echo 'DNS-транспорт: локальный UDP через роутер; при синтетическом/несовпадающем ответе выполняется контрольный DoH; DoT оценивается отдельно как TLS-транспорт.' ;; EN:DNS_TRANSPORT) echo 'DNS transport: local UDP through the router; a DoH cross-check is performed for synthetic/mismatching answers; DoT is evaluated separately as TLS transport.' ;;
+        RU:DEBUG_ONLY) echo 'Глубокая проверка C0001/C0002/... выполняется только в «77 → [5] Расширенная диагностика».' ;; EN:DEBUG_ONLY) echo 'Deep C0001/C0002/... verification runs only in “77 → [5] Extended diagnostics”.' ;;
+        RU:RESTORED) echo 'Восстановление завершено: состояние сервисов и firewall возвращено.' ;; EN:RESTORED) echo 'Restore completed: service and firewall state restored.' ;;
+        RU:BLOCKCHECK_TARGET_INFO1) echo 'Один запуск blockcheck = один целевой домен.' ;; EN:BLOCKCHECK_TARGET_INFO1) echo 'One blockcheck run = one target domain.' ;;
+        RU:BLOCKCHECK_TARGET_INFO2) echo 'После выбора сервиса показывается весь список валидных доменов для контроля.' ;; EN:BLOCKCHECK_TARGET_INFO2) echo 'After selecting a service, the full list of valid domains is shown.' ;;
+        RU:BLOCKCHECK_TARGET_INFO3) echo 'Для запуска автоматически выбирается первый валидный домен; массовый прогон всех доменов отключён.' ;; EN:BLOCKCHECK_TARGET_INFO3) echo 'The first valid domain is selected automatically; all-domain bulk runs are disabled.' ;;
+        RU:SELECT_BC_SERVICE) printf '%s' 'Сервис для blockcheck: ' ;; EN:SELECT_BC_SERVICE) printf '%s' 'Blockcheck service: ' ;;
+        RU:LIST_UPDATE) echo 'Обновление списков доменов...' ;; EN:LIST_UPDATE) echo 'Updating domain lists...' ;;
+        RU:LIST_UPDATED) printf '%s' 'Список %s обновлён (%s доменов).' ;; EN:LIST_UPDATED) printf '%s' 'Updated %s list (%s domains).' ;;
+        RU:LIST_CACHE) printf '%s' 'Список %s: используется кэш (%s).' ;; EN:LIST_CACHE) printf '%s' 'List %s: using cached copy (%s).' ;;
+        RU:LIST_DISABLED) echo 'Автообновление списков отключено.' ;; EN:LIST_DISABLED) echo 'Automatic list updates are disabled.' ;;
+        RU:PKG_MANAGER_NONE) echo 'Пакетный менеджер не найден. Поддерживаются: apk, opkg, apt, dnf, yum, pacman, zypper.' ;; EN:PKG_MANAGER_NONE) echo 'No supported package manager found. Supported: apk, opkg, apt, dnf, yum, pacman, zypper.' ;;
+        RU:INSTALLED_LIST) printf '%s' 'Список установленных пакетов: ' ;; EN:INSTALLED_LIST) printf '%s' 'Installed package list: ' ;;
+        RU:PROGRAM_VERSION) printf '%s' 'Версия программы' ;; EN:PROGRAM_VERSION) printf '%s' 'Program version' ;;
+        RU:ZAPRET_VERSION) printf '%s' 'Версия zapret' ;; EN:ZAPRET_VERSION) printf '%s' 'zapret version' ;;
+        RU:ZAPRET2_VERSION) printf '%s' 'Версия zapret2' ;; EN:ZAPRET2_VERSION) printf '%s' 'zapret2 version' ;;
+        RU:DNS_SERVERS) printf '%s' 'DNS' ;; EN:DNS_SERVERS) printf '%s' 'DNS servers' ;;
+        RU:CURL) printf '%s' 'curl' ;; EN:CURL) printf '%s' 'curl' ;;
+
+        RU:NOACCESS) echo 'Недоступен' ;; EN:NOACCESS) echo 'Unavailable' ;;
+        RU:PORT) echo 'ПОРТ' ;; EN:PORT) echo 'PORT' ;;
+        RU:PORT_UNKNOWN) echo 'Не проверен' ;; EN:PORT_UNKNOWN) echo 'Not tested' ;;
+        RU:BLOCKED) echo 'ЗАБЛОКИРОВАНО' ;; EN:BLOCKED) echo 'BLOCKED' ;;
+        RU:SELECT_ENGINE) echo 'ВЫБОР ДВИЖКА' ;; EN:SELECT_ENGINE) echo 'SELECT ENGINE' ;;
+        RU:AUTOMATIC_ENGINE) echo 'Автоматически (все найденные движки)' ;; EN:AUTOMATIC_ENGINE) echo 'Automatic (all detected engines)' ;;
+        RU:NO_ENGINE) echo '[!] Движок zapret не найден.' ;; EN:NO_ENGINE) echo '[!] No zapret engine detected.' ;;
+        RU:INVALID_PROFILE) echo 'Неверный профиль.' ;; EN:INVALID_PROFILE) echo 'Invalid profile.' ;;
+        RU:INVALID_ENGINE) echo 'Неверный выбор движка.' ;; EN:INVALID_ENGINE) echo 'Invalid engine selection.' ;;
+        RU:ENGINE_SELECTED) echo 'Выбранный движок' ;; EN:ENGINE_SELECTED) echo 'Engine selection' ;;
+        RU:BLOCKCHECK_MENU) echo 'Диагностика blockcheck' ;; EN:BLOCKCHECK_MENU) echo 'Blockcheck diagnostics' ;;
+        RU:SERVICE_MENU) echo 'Сервисное меню' ;; EN:SERVICE_MENU) echo 'Service menu' ;;
+        RU:STOP) echo 'Остановить текущий тест' ;; EN:STOP) echo 'Stop current test' ;;
+        RU:MANAGE_CUSTOM) echo 'Управление своими сервисами' ;; EN:MANAGE_CUSTOM) echo 'Manage custom services' ;;
+        RU:EDIT_CUSTOM) echo 'Редактировать свой сервис' ;; EN:EDIT_CUSTOM) echo 'Edit custom service' ;;
+        RU:DELETE_CUSTOM) echo 'Удалить свой сервис' ;; EN:DELETE_CUSTOM) echo 'Delete custom service' ;;
+        RU:NO_CUSTOM) echo 'Пользовательских сервисов нет.' ;; EN:NO_CUSTOM) echo 'No custom services.' ;;
+        RU:DOMAIN_INVALID) echo 'Некорректный домен. Используй домен вида example.com без http://, пути и порта.' ;; EN:DOMAIN_INVALID) echo 'Invalid domain. Use an FQDN like example.com without scheme, path or port.' ;;
+        RU:DUP_CUSTOM) echo 'Сервис с таким именем уже существует.' ;; EN:DUP_CUSTOM) echo 'A service with this name already exists.' ;;
+        RU:BC_ONE_DOMAIN) echo 'Blockcheck проверяет только один выбранный домен за запуск.' ;; EN:BC_ONE_DOMAIN) echo 'Blockcheck checks only one selected domain per run.' ;;
+        RU:BC_SERVICE_PROMPT) printf '%s' 'Сервис для blockcheck: ' ;; EN:BC_SERVICE_PROMPT) printf '%s' 'Service for blockcheck: ' ;;
+        RU:SELECT_SERVICES) printf '%s' 'Выбор (например 1,2,3, a или c): ' ;; EN:SELECT_SERVICES) printf '%s' 'Select (e.g. 1,2,3, a or c): ' ;;
+        RU:SELECTED_SERVICES) echo 'Выбранные сервисы:' ;; EN:SELECTED_SERVICES) echo 'Selected services:' ;;
+        RU:NO_SAVED_LOGS) echo 'Нет сохранённых отчётов.' ;; EN:NO_SAVED_LOGS) echo 'No saved test logs.' ;;
+        RU:NO_SERVICES) echo 'Сервисы не выбраны.' ;; EN:NO_SERVICES) echo 'No services selected.' ;;
+        RU:INVALID) echo 'Неверный выбор.' ;; EN:INVALID) echo 'Invalid selection.' ;;
+        RU:ADD_NAME) printf '%s' 'Название сервиса: ' ;; EN:ADD_NAME) printf '%s' 'Enter service name: ' ;;
+        RU:ADD_DOMAINS) printf '%s' 'Домены (через пробел): ' ;; EN:ADD_DOMAINS) printf '%s' 'Enter domains (space separated): ' ;;
+        RU:ADD_TCP) printf '%s' 'TCP-порты [443]: ' ;; EN:ADD_TCP) printf '%s' 'TCP ports [443]: ' ;;
+        RU:ADD_UDP) printf '%s' 'UDP-порты [443]: ' ;; EN:ADD_UDP) printf '%s' 'UDP ports [443]: ' ;;
+        RU:ADDED) printf '%s' 'Добавлен сервис: ' ;; EN:ADDED) printf '%s' 'Added service: ' ;;
+        RU:USE_NATIVE) echo 'Нативные тесты OpenWrt; сторонние benchmark-скрипты не выполняются.' ;; EN:USE_NATIVE) echo 'Native OpenWrt tests; third-party benchmark scripts are not executed.' ;;
+        RU:OUTPUT_DIR) printf '%s' 'Каталог результатов' ;; EN:OUTPUT_DIR) printf '%s' 'Results directory' ;;
+        RU:SAVED_REPORTS) echo 'Сохранённые отчёты тестов' ;; EN:SAVED_REPORTS) echo 'Saved test reports' ;;
+        RU:STARTED) printf '%s' 'Начало' ;; EN:STARTED) printf '%s' 'Started' ;;
+        RU:PREPARE_BASELINE) echo 'Подготовка тестирования' ;; EN:PREPARE_BASELINE) echo 'Preparing tests' ;;
+        RU:BASELINE_PROFILE) echo 'Профиль' ;; EN:BASELINE_PROFILE) echo 'Profile' ;;
+        RU:SERVICES) echo 'Сервисы' ;; EN:SERVICES) echo 'Services' ;;
+        RU:DOMAINS) echo 'Домены' ;; EN:DOMAINS) echo 'Domains' ;;
+        RU:BASELINE_DONE) echo 'Базовая проверка завершена' ;; EN:BASELINE_DONE) echo 'Baseline preparation completed' ;;
+        RU:RUNNING) echo 'Идёт тестирование' ;; EN:RUNNING) echo 'Testing in progress' ;;
+        RU:STRATEGY_AVAILABLE) echo 'РАБОТАЕТ' ;; EN:STRATEGY_AVAILABLE) echo 'WORKS' ;;
+        RU:STRATEGY_UNAVAILABLE) echo 'НЕ РАБОТАЕТ' ;; EN:STRATEGY_UNAVAILABLE) echo 'NOT WORKING' ;;
+        RU:LIVE_OUTPUT) echo '[ СТАРТ ] Вывод теста:' ;; EN:LIVE_OUTPUT) echo '[ START ] Live test output:' ;;
+        RU:PROCESS_HINT1) echo 'Ctrl-C останавливает текущий blockcheck и очищает дерево процессов.' ;; EN:PROCESS_HINT1) echo 'Ctrl-C stops the current blockcheck and cleans its process tree.' ;;
+        RU:PROCESS_HINT2) echo 'Для остановки из другого терминала: zapret-test stop' ;; EN:PROCESS_HINT2) echo 'To stop from another terminal: zapret-test stop' ;;
+        RU:STAGE) echo 'ЭТАП' ;; EN:STAGE) echo 'STAGE' ;;
+        RU:STRATEGY) echo 'СТРАТЕГИЯ' ;; EN:STRATEGY) echo 'STRATEGY' ;;
+        RU:RESULT) echo 'РЕЗУЛЬТАТ' ;; EN:RESULT) echo 'RESULT' ;;
+        RU:STATUS_PASS) echo 'РАБОТАЕТ' ;; EN:STATUS_PASS) echo 'PASS' ;;
+        RU:STATUS_PARTIAL) echo 'ЧАСТИЧНО' ;; EN:STATUS_PARTIAL) echo 'PARTIAL' ;;
+        RU:STATUS_FAIL) echo 'НЕ РАБОТАЕТ' ;; EN:STATUS_FAIL) echo 'FAIL' ;;
+        RU:STATUS_SKIPPED) echo 'ПРОПУЩЕНО' ;; EN:STATUS_SKIPPED) echo 'SKIPPED' ;;
+        RU:STATUS_INTERRUPTED) echo 'ПРЕРВАНО' ;; EN:STATUS_INTERRUPTED) echo 'INTERRUPTED' ;;
+        RU:STATUS_COMPLETED) echo 'ЗАВЕРШЕНО' ;; EN:STATUS_COMPLETED) echo 'COMPLETED' ;;
+        RU:STATUS_ERROR) echo 'ОШИБКА' ;; EN:STATUS_ERROR) echo 'ERROR' ;;
+        RU:TAG_RUNNING) echo 'ВЫПОЛНЕНИЕ' ;; EN:TAG_RUNNING) echo 'RUNNING' ;;
+        RU:TAG_INFO) echo 'ИНФО' ;; EN:TAG_INFO) echo 'INFO' ;;
+        RU:TAG_WARNING) echo 'ПРЕДУПРЕЖДЕНИЕ' ;; EN:TAG_WARNING) echo 'WARNING' ;;
+        RU:TAG_STOP) echo 'ОСТАНОВКА' ;; EN:TAG_STOP) echo 'STOP' ;;
+        RU:TAG_ERROR) echo 'ОШИБКА' ;; EN:TAG_ERROR) echo 'ERROR' ;;
+        RU:TAG_DONE) echo 'ЗАВЕРШЕНО' ;; EN:TAG_DONE) echo 'DONE' ;;
+        RU:TAG_PROCESS) echo 'ПРОЦЕСС' ;; EN:TAG_PROCESS) echo 'PROCESS' ;;
+        RU:TAG_SAVED) echo 'СОХРАНЕНО' ;; EN:TAG_SAVED) echo 'SAVED' ;;
+        RU:TAG_NOT_SAVED) echo 'НЕ СОХРАНЕНО' ;; EN:TAG_NOT_SAVED) echo 'NOT SAVED' ;;
+        RU:TAG_TARGET) echo 'ЦЕЛЬ' ;; EN:TAG_TARGET) echo 'TARGET' ;;
+        RU:TAG_SUMMARY) echo 'СВОДКА' ;; EN:TAG_SUMMARY) echo 'SUMMARY' ;;
+        RU:TAG_RESULT) echo 'РЕЗУЛЬТАТ' ;; EN:TAG_RESULT) echo 'RESULT' ;;
+        RU:TAG_FAIL) echo 'ОШИБКА' ;; EN:TAG_FAIL) echo 'FAIL' ;;
+        RU:INFO_PREREQ) echo 'Проверка зависимостей' ;; EN:INFO_PREREQ) echo 'checking prerequisites' ;;
+        RU:INFO_DNS) echo 'Проверка DNS' ;; EN:INFO_DNS) echo 'checking DNS' ;;
+        RU:INFO_DOH) echo 'Поиск рабочего DoH-сервера' ;; EN:INFO_DOH) echo 'searching working DoH server' ;;
+        RU:INFO_NFQ_REDIRECT) echo 'Подготовка перенаправления nfqws2' ;; EN:INFO_NFQ_REDIRECT) echo 'preparing nfqws2 redirection' ;;
+        RU:INFO_HTTP3_DISABLED) echo 'Установленный curl не поддерживает HTTP/3 QUIC. Тесты HTTP/3 отключены.' ;; EN:INFO_HTTP3_DISABLED) echo 'Installed curl does not support HTTP/3 QUIC. HTTP/3 tests are disabled.' ;;
+        RU:INFO_DPI_ALREADY_RUNNING) echo 'Обнаружены запущенные процессы обхода DPI.' ;; EN:INFO_DPI_ALREADY_RUNNING) echo 'DPI-bypass processes are already running.' ;;
+        RU:INFO_DPI_REQUIRED_STOP) echo 'Для blockcheck все методы обхода DPI должны быть остановлены.' ;; EN:INFO_DPI_REQUIRED_STOP) echo 'All DPI-bypass methods must be stopped for blockcheck.' ;;
+        RU:INFO_DPI_STOP_HINT) echo 'Остановите все экземпляры обхода DPI, которые могут влиять на результат.' ;; EN:INFO_DPI_STOP_HINT) echo 'Stop all DPI-bypass instances that may interfere with blockcheck.' ;;
+        RU:SUMMARY) echo 'Сводка' ;; EN:SUMMARY) echo 'Summary' ;;
+        RU:RAW_REPORT) echo 'Raw-вывод' ;; EN:RAW_REPORT) echo 'Raw output' ;;
+        *) echo "$key" ;;
+    esac
+}
+
+ui_pause() { t PRESS_ENTER; read dummy || true; }
+timeout_works() { has timeout && timeout 1 true >/dev/null 2>&1; }
+internal_timeout() {
+    limit="$1"; shift
+    case "$limit" in
+        ""|*[!0-9]*) "$@"; return $? ;;
+    esac
+    [ "$limit" -gt 0 ] || { "$@"; return $?; }
+    "$@" &
+    child="$!"
+    start="$(date +%s 2>/dev/null || echo 0)"
+    while :; do
+        state="$(ps -o stat= -p "$child" 2>/dev/null | tr -d " ")"
+        [ -n "$state" ] || break
+        case "$state" in Z*) break;; esac
+        now="$(date +%s 2>/dev/null || echo "$start")"
+        elapsed=$((now-start))
+        if [ "$elapsed" -ge "$limit" ]; then
+            kill_tree "$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+    done
+    wait "$child" 2>/dev/null
+    return $?
+}
+need_root() { [ "$(id -u 2>/dev/null || echo 1)" = 0 ] || die "run as root"; }
+load_config() { [ -f "$CONFIG" ] && . "$CONFIG"; }
+now_ms() { date +%s%3N 2>/dev/null || echo "$(date +%s)000"; }
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r/\\r/g; s/\n/\\n/g'; }
+
+init_dirs() { mkdir -p "$RUN" "$BACKUP" "$DEBUGDIR" "$BLOCKDIR" "$STATE" "$PROFILES" "$CUSTOM_STRATEGIES" "$BUNDLED" "$EXTERNAL_DIR"; }
+
+
+# ---------- process control ----------
+kill_tree() {
+    p="$1"
+    [ -n "$p" ] || return 0
+    [ -d "/proc/$p" ] || return 0
+    children="$(cat "/proc/$p/task/$p/children" 2>/dev/null || true)"
+    for c in $children; do kill_tree "$c"; done
+    kill -TERM "$p" 2>/dev/null || true
+}
+
+kill_active_record() {
+    f="$1"
+    [ -f "$f" ] || return 1
+    IFS='|' read -r p pgid isolated < "$f" || return 1
+    case "$p" in ''|*[!0-9]*) rm -f "$f"; return 1;; esac
+    if [ "$isolated" = 1 ] && [ -n "$pgid" ]; then
+        case "$pgid" in ''|*[!0-9]*) isolated=0;; esac
+    fi
+    if [ "$isolated" = 1 ] && [ -n "$pgid" ] && [ "$pgid" != "0" ]; then
+        say "[$(t TAG_STOP)] terminating isolated process group (pid=$p pgid=$pgid)"
+        kill -TERM -"$pgid" 2>/dev/null || true
+        sleep 1
+        kill -KILL -"$pgid" 2>/dev/null || true
+        return 0
+    fi
+    if kill -0 "$p" 2>/dev/null; then
+        say "[$(t TAG_STOP)] terminating test process tree (pid=$p)"
+        kill_tree "$p"
+        sleep 1
+        kill -KILL "$p" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+proc_cmdline() {
+    p="$1"
+    [ -r "/proc/$p/cmdline" ] || return 1
+    tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//'
+}
+
+proc_ppid() {
+    p="$1"
+    [ -r "/proc/$p/stat" ] || return 1
+    awk '{print $4}' "/proc/$p/stat" 2>/dev/null
+}
+
+is_zapret_test_cmd() {
+    cmd="$1"
+    case "$cmd" in
+        *'/zapret-test'*|*' zapret-test'|*'/usr/bin/zapret-test'*) return 0;;
+    esac
+    return 1
+}
+
+find_active_zapret_test_root() {
+    self="$1"
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [ -r "$d/cmdline" ] || continue
+        [ "$pid" = "$self" ] && continue
+        cmd="$(proc_cmdline "$pid" 2>/dev/null || true)"
+        [ -n "$cmd" ] || continue
+        if is_zapret_test_cmd "$cmd"; then
+            case "$cmd" in
+                *' stop'*) continue;;
+                *' --version'*) continue;;
+                *' --help'*) continue;;
+            esac
+            echo "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+stop_active_test() {
+    stopped=0
+    for f in "$RUN/active.blockcheck.pid" "$RUN/active.external.pid"; do
+        if kill_active_record "$f"; then stopped=1; fi
+        rm -f "$f"
+    done
+    [ "$stopped" = 1 ] && { rm -f "$RUN/active.main.pid"; return 0; }
+
+    # Cross-version fallback: older zapret-test releases may have lost the
+    # active.* marker while their blockcheck process is still running. Find
+    # the owning zapret-test process and stop its process tree.
+    root_pid="$(find_active_zapret_test_root "$$" 2>/dev/null || true)"
+    if [ -n "$root_pid" ]; then
+        say "[$(t TAG_STOP)] Found active zapret-test process (pid=$root_pid); terminating process tree."
+        kill_tree "$root_pid"
+        sleep 1
+        kill -KILL "$root_pid" 2>/dev/null || true
+        rm -f "$RUN/active.main.pid" "$RUN/active.blockcheck.pid" "$RUN/active.external.pid"
+        return 0
+    fi
+
+    say '[STOP] No active zapret-test process found.'
+    return 1
+}
+
+cleanup_on_signal() {
+    sig="$1"
+    say ''
+    say "[$(t TAG_STOP)] Caught $sig. Stopping current test..."
+    zapret_test_signal_handler "$sig"
+}
+
+# ---------- detection ----------
+detect_path() {
+    p=""
+    for p in "$@"; do [ -x "$p" ] && { echo "$p"; return 0; }; done
+    return 1
+}
+
+detect_zapret() {
+    ZAPRET_BASE=""
+    if [ -n "${ZAPRET_TEST_ZAPRET_BASE:-}" ] && [ -f "$ZAPRET_TEST_ZAPRET_BASE/blockcheck.sh" ]; then
+        ZAPRET_BASE="$ZAPRET_TEST_ZAPRET_BASE"
+        BLOCKCHECK="$ZAPRET_BASE/blockcheck.sh"
+        [ -x "$ZAPRET_BASE/nfq/nfqws" ] && NFQWS="$ZAPRET_BASE/nfq/nfqws"
+        [ -x "$ZAPRET_BASE/tpws/tpws" ] && TPWS="$ZAPRET_BASE/tpws/tpws"
+        return 0
+    fi
+    BLOCKCHECK=""
+    NFQWS=""
+    TPWS=""
+    for b in /opt/zapret /usr/share/zapret /usr/lib/zapret; do
+        [ -f "$b/blockcheck.sh" ] || continue
+        ZAPRET_BASE="$b"
+        BLOCKCHECK="$b/blockcheck.sh"
+        [ -x "$b/nfq/nfqws" ] && NFQWS="$b/nfq/nfqws"
+        [ -x "$b/tpws/tpws" ] && TPWS="$b/tpws/tpws"
+        break
+    done
+    [ -n "$BLOCKCHECK" ] || BLOCKCHECK="$(detect_path /usr/bin/blockcheck.sh /usr/sbin/blockcheck.sh 2>/dev/null || true)"
+    [ -n "$NFQWS" ] || NFQWS="$(detect_path /usr/bin/nfqws /usr/sbin/nfqws 2>/dev/null || true)"
+    [ -n "$TPWS" ] || TPWS="$(detect_path /usr/bin/tpws /usr/sbin/tpws 2>/dev/null || true)"
+    [ -n "$BLOCKCHECK" ] && ZAPRET_BASE="$(cd "$(dirname "$BLOCKCHECK")" 2>/dev/null && pwd)"
+}
+
+detect_zapret2() {
+    ZAPRET2_BASE=""
+    if [ -n "${ZAPRET_TEST_ZAPRET2_BASE:-}" ] && [ -f "$ZAPRET_TEST_ZAPRET2_BASE/blockcheck2.sh" ]; then
+        ZAPRET2_BASE="$ZAPRET_TEST_ZAPRET2_BASE"
+        BLOCKCHECK2="$ZAPRET2_BASE/blockcheck2.sh"
+        [ -x "$ZAPRET2_BASE/nfq2/nfqws2" ] && NFQWS2="$ZAPRET2_BASE/nfq2/nfqws2"
+        return 0
+    fi
+    BLOCKCHECK2=""
+    NFQWS2=""
+    for b in /opt/zapret2 /usr/share/zapret2 /usr/lib/zapret2; do
+        [ -f "$b/blockcheck2.sh" ] || continue
+        ZAPRET2_BASE="$b"
+        BLOCKCHECK2="$b/blockcheck2.sh"
+        [ -x "$b/nfq2/nfqws2" ] && NFQWS2="$b/nfq2/nfqws2"
+        break
+    done
+    [ -n "$BLOCKCHECK2" ] || BLOCKCHECK2="$(detect_path /usr/bin/blockcheck2.sh /usr/sbin/blockcheck2.sh 2>/dev/null || true)"
+    [ -n "$NFQWS2" ] || NFQWS2="$(detect_path /usr/bin/nfqws2 /usr/sbin/nfqws2 2>/dev/null || true)"
+    [ -n "$BLOCKCHECK2" ] && ZAPRET2_BASE="$(cd "$(dirname "$BLOCKCHECK2")" 2>/dev/null && pwd)"
+}
+
+get_version() {
+    b="$1"
+    [ -x "$b" ] || { echo "UNAVAILABLE"; return; }
+    for arg in --version -V; do
+        out="$($b $arg 2>&1 | head -n 3)"
+        [ -n "$out" ] && { echo "$out" | tr '\n' ' '; return; }
+    done
+    echo "UNKNOWN"
+}
+
+detect_fw() {
+    FW="unknown"
+    if has fw4 && fw4 -q status >/dev/null 2>&1; then FW="fw4/nftables";
+    elif has nft && nft list ruleset >/dev/null 2>&1; then FW="nftables";
+    elif has fw3 && fw3 status >/dev/null 2>&1; then FW="fw3/iptables";
+    elif has iptables && iptables -S >/dev/null 2>&1; then FW="iptables"; fi
+    case "$FW" in nftables|fw4/nftables) FWTYPE=nftables;; *) FWTYPE=iptables;; esac
+}
+
+detect_system() {
+    SYSTEM="$(uname -a 2>/dev/null)"
+    OPENWRT_RELEASE="$(cat /etc/openwrt_release 2>/dev/null | tr '\n' ' ' || true)"
+    OPENWRT_ID=""; OW_RELEASE=""; OW_REVISION=""; OW_DESCRIPTION=""; OW_TARGET=""; OW_ARCH=""
+    if [ -f /etc/openwrt_release ]; then
+        . /etc/openwrt_release 2>/dev/null || true
+        OPENWRT_ID="${DISTRIB_ID:-}"
+        OW_RELEASE="${DISTRIB_RELEASE:-}"
+        OW_REVISION="${DISTRIB_REVISION:-}"
+        OW_DESCRIPTION="${DISTRIB_DESCRIPTION:-}"
+        OW_TARGET="${DISTRIB_TARGET:-}"
+        OW_ARCH="${DISTRIB_ARCH:-}"
+    fi
+    [ -n "$OW_DESCRIPTION" ] || OW_DESCRIPTION="${OPENWRT_ID:-OpenWrt} ${OW_RELEASE:-unknown} ${OW_REVISION:-}"
+    BOARD_JSON="$(ubus call system board 2>/dev/null || true)"
+    DEVICE_MODEL="$(printf '%s' "$BOARD_JSON" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="$(cat /tmp/sysinfo/model 2>/dev/null || true)"
+    [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="$(printf '%s' "$BOARD_JSON" | sed -n 's/.*"board_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="$(cat /tmp/sysinfo/board_name 2>/dev/null || true)"
+    ARCH="${OW_ARCH:-}"
+    [ -n "$ARCH" ] || ARCH="$(printf '%s' "$BOARD_JSON" | sed -n 's/.*"architecture":"\([^"]*\)".*/\1/p' | head -n1)"
+    [ -n "$ARCH" ] || ARCH="$(uname -m)"
+    KERNEL="$(uname -r 2>/dev/null)"
+    detect_fw
+    DNS_SERVERS="$(awk '/^nameserver /{print $2}' /etc/resolv.conf 2>/dev/null | tr '\n' ' ' || true)"
+    IPV6_STATE=enabled
+    sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null | grep -qx 1 && IPV6_STATE=disabled
+}
+
+# ---------- backup/restore ----------
+backup_create() {
+    rm -rf "$BACKUP"; mkdir -p "$BACKUP"
+    date > "$BACKUP/timestamp"
+    [ -d /etc/config ] && tar -czf "$BACKUP/etc-config.tgz" /etc/config 2>/dev/null || true
+    [ -d /etc/zapret ] && tar -czf "$BACKUP/etc-zapret.tgz" /etc/zapret 2>/dev/null || true
+    [ -d /etc/zapret2 ] && tar -czf "$BACKUP/etc-zapret2.tgz" /etc/zapret2 2>/dev/null || true
+    [ -f /etc/config/firewall ] && cp -p /etc/config/firewall "$BACKUP/firewall.uci"
+    has nft && nft -a list ruleset > "$BACKUP/nft-ruleset.txt" 2>&1 || true
+    has iptables-save && iptables-save > "$BACKUP/iptables-save.txt" 2>&1 || true
+    has ip6tables-save && ip6tables-save > "$BACKUP/ip6tables-save.txt" 2>&1 || true
+    ps w > "$BACKUP/ps.txt" 2>&1 || true
+    ubus call system board > "$BACKUP/ubus-board.json" 2>&1 || true
+    log "backup created"
+}
+
+service_status() {
+    if has /etc/init.d/zapret; then /etc/init.d/zapret status > "$BACKUP/zapret-status.txt" 2>&1 || true; fi
+    if has /etc/init.d/zapret2; then /etc/init.d/zapret2 status > "$BACKUP/zapret2-status.txt" 2>&1 || true; fi
+}
+
+stop_engine_services() {
+    ORIG_SERVICE=0
+    ZAPRET_WAS_ACTIVE=0
+    ZAPRET2_WAS_ACTIVE=0
+    if [ -x /etc/init.d/zapret ]; then /etc/init.d/zapret status >/dev/null 2>&1 && { ZAPRET_WAS_ACTIVE=1; /etc/init.d/zapret stop >/dev/null 2>&1 || return 1; ORIG_SERVICE=1; }; fi
+    if [ -x /etc/init.d/zapret2 ]; then /etc/init.d/zapret2 status >/dev/null 2>&1 && { ZAPRET2_WAS_ACTIVE=1; /etc/init.d/zapret2 stop >/dev/null 2>&1 || return 1; ORIG_SERVICE=1; }; fi
+    sleep "${WAIT_AFTER_RESTART:-3}"
+    return 0
+}
+
+restart_engine_services() {
+    rc=0
+    if [ "$ZAPRET_WAS_ACTIVE" = 1 ] && [ -x /etc/init.d/zapret ]; then /etc/init.d/zapret start >/dev/null 2>&1 || rc=1; fi
+    if [ "$ZAPRET2_WAS_ACTIVE" = 1 ] && [ -x /etc/init.d/zapret2 ]; then /etc/init.d/zapret2 start >/dev/null 2>&1 || rc=1; fi
+    sleep "${WAIT_AFTER_RESTART:-3}"
+    return "$rc"
+}
+
+cleanup_ours() {
+    kill_running 2>/dev/null || true
+    if [ "$FWTYPE" = nftables ] && has nft; then nft delete table inet "$NFT_TABLE" 2>/dev/null || true; fi
+    if [ "$FWTYPE" = iptables ] && has iptables; then
+        iptables -t mangle -D OUTPUT -j "$IPT_CHAIN" 2>/dev/null || true
+        iptables -t mangle -F "$IPT_CHAIN" 2>/dev/null || true
+        iptables -t mangle -X "$IPT_CHAIN" 2>/dev/null || true
+    fi
+}
+
+restore_all() {
+    cleanup_ours
+    rc=0
+    # The preferred rollback is service-level: restore only what we stopped/temporarily changed.
+    if ! restart_engine_services; then rc=1; fi
+    if [ "$rc" = 0 ]; then ROLLBACK_OK=1; else ROLLBACK_OK=0; fi
+    log "restore rc=$rc"
+    return "$rc"
+}
+
+zapret_test_signal_handler() {
+    sig="$1"
+    # Stage-specific handlers must not be installed permanently: this dispatcher
+    # remains active for the whole interactive session.
+    case "${SIGNAL_STAGE:-}" in
+        blockcheck)
+            blockcheck_signal_handler 2>/dev/null || true
+            ;;
+        external)
+            external_signal_handler 2>/dev/null || true
+            ;;
+        strategy)
+            strategy_signal_handler 2>/dev/null || true
+            ;;
+        *)
+            cleanup_ours 2>/dev/null || true
+            rm -f "$RUN/active.main.pid" "$RUN/active.blockcheck.pid" "$RUN/active.external.pid" "$RUN/active.strategy.pid"
+            exit 130
+            ;;
+    esac
+}
+zapret_test_exit_handler() {
+    rc="$?"
+    cleanup_ours 2>/dev/null || true
+    rm -f "$RUN/active.main.pid" "$RUN/active.blockcheck.pid" "$RUN/active.external.pid" "$RUN/active.strategy.pid"
+    exit "$rc"
+}
+trap 'zapret_test_signal_handler INT' INT
+trap 'zapret_test_signal_handler TERM' TERM
+trap 'zapret_test_exit_handler' EXIT
+
+# ---------- services ----------
+ensure_default_files() {
+    mkdir -p "$ETC"
+    [ -f "$CONFIG" ] || cat > "$CONFIG" <<'EOF2'
+ATTEMPTS=3
+TIMEOUT=10
+# Upstream blockcheck2 probe timeout; keep separate from generic diagnostic TIMEOUT.
+BLOCKCHECK_CURL_MAX_TIME=2
+BLOCKCHECK_CURL_MAX_TIME_QUIC=2
+STRATEGY_TIMEOUT=60
+BLOCKCHECK_TIMEOUT=0
+WAIT_AFTER_RESTART=3
+MAX_COMBINATIONS=20
+ENABLE_UDP=1
+ENABLE_HTTP3=1
+ENABLE_TCPDUMP=0
+MAX_LOAD=0
+MAX_RAM_USAGE=0
+MAX_TEST_TIME=900
+TEST_CLIENT=curl
+TEST_IPV4=1
+TEST_IPV6=1
+BLOCKCHECK_SCANLEVEL=standard
+BLOCKCHECK_OUTPUT_MODE=summary
+QUICK_ATTEMPTS=1
+QUICK_MAX_CANDIDATES=12
+FULL_MAX_CANDIDATES=0
+
+# isolated=own temporary NFQUEUE/nft rules; service=modify installed service config externally (not automatic in v1)
+TEST_HOOK_MODE=isolated
+
+# External/VPS-style diagnostics
+ENABLE_EXTERNAL_TESTS=1
+EXTERNAL_TIMEOUT=300
+ENABLE_LIST_AUTOUPDATE=1
+EOF2
+    [ -f "$CONTROL" ] || cat > "$CONTROL" <<'EOF2'
+iana.org
+example.com
+openwrt.org
+EOF2
+    [ -f "$AVAIL_CONFIG" ] || cat > "$AVAIL_CONFIG" <<'EOF2'
+# Native availability diagnostics configuration.
+# Native tests intentionally avoid executing third-party VPS benchmark scripts.
+DPI_DOMAINS="youtube.com discord.com instagram.com facebook.com x.com linkedin.com rutracker.org digitalocean.com amnezia.org getoutline.org mailfence.com flibusta.is rezka.ag api.telegram.org play.google.com"
+GEO_DOMAINS="spotify.com netflix.com patreon.com swagger.io snyk.io mongodb.com autodesk.com graylog.org redis.io copilot.microsoft.com"
+RUSSIAN_IPERF_SOURCE="https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh"
+DOH_URL="https://cloudflare-dns.com/dns-query"
+EOF2
+    [ -f "$SERVICES" ] || cat > "$SERVICES" <<'EOF2'
+# Blank line starts a new record.
+SERVICE=YouTube
+PRIMARY_DOMAIN=youtube.com
+DESCRIPTION=YouTube web/video related endpoints
+DOMAINS="youtube.com www.youtube.com googlevideo.com ytimg.com yting.com ggpht.com youtubekids.com youtu.be yt.be youtube-nocookie.com wide-youtube.l.google.com ytimg.l.google.com youtubei.googleapis.com youtubeembeddedplayer.googleapis.com youtube-ui.l.google.com yt-video-upload.l.google.com jnn-pa.googleapis.com returnyoutubedislikeapi.com yt3.googleusercontent.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Discord
+PRIMARY_DOMAIN=discord.com
+DESCRIPTION=Discord web/API endpoints; voice is separate and unverified by default
+DOMAINS="discord.com www.discord.com dis.gd discord.co discord.design discord.dev discord.gg discord.gift discord.gifts discord.media discord.new discord.store discord.tools discordapp.com discordapp.net discordmerch.com discordpartygames.com discord-activities.com discordactivities.com discordsays.com discord-attachments-uploads-prd.storage.googleapis.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Telegram
+PRIMARY_DOMAIN=telegram.org
+DESCRIPTION=Telegram web endpoints
+DOMAINS="telegram.org web.telegram.org t.me cdn-telegram.org comments.app contest.com fragment.com graph.org quiz.directory tdesktop.com telega.one telegra.ph telegram-cdn.org telegram.dog telegram.me telegram.space telesco.pe tg.dev tx.me usercontent.dev ton.org"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+
+SERVICE=Google
+PRIMARY_DOMAIN=google.com
+DESCRIPTION=Google web
+DOMAINS="google.com www.google.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Instagram
+PRIMARY_DOMAIN=instagram.com
+DESCRIPTION=Instagram web
+DOMAINS="instagram.com www.instagram.com ig.me cdninstagram.com fbcdn.net fbsbx.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=TikTok
+PRIMARY_DOMAIN=tiktok.com
+DESCRIPTION=TikTok web
+DOMAINS="tiktok.com www.tiktok.com byteoversea.com ibytedtos.com muscdn.com musical.ly tik-tokapi.com tiktokcdn-us.com tiktokcdn-eu.com tiktokcdn.com tiktokd.net tiktokd.org tiktokv.com tiktokv.us tiktokw.us ttwstatic.com tiktokv.eu"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=NVIDIA
+PRIMARY_DOMAIN=nvidia.com
+DESCRIPTION=NVIDIA web, driver download, GeForce and NVIDIA App endpoints
+DOMAINS="nvidia.com www.nvidia.com download.nvidia.com international.download.nvidia.com international-gfe.download.nvidia.com us.download.nvidia.com developer.nvidia.com gfwsl.geforce.com gfe.nvidia.com activation.gfe.nvidia.com api.gfe.nvidia.com services.gfe.nvidia.com telemetry.gfe.nvidia.com events.gfe.nvidia.com ota.nvidia.com ota-downloads.nvidia.com images.nvidia.com img.nvidiagrid.net images.nvidiagrid.net assets.nvidiagrid.net rds-assets.nvidia.com ls.dtrace.nvidia.com accounts.nvgs.nvidia.com login.nvidia.com login.nvgs.nvidia.com accounts.nvgs.nvidia.cn login.nvgs.nvidia.cn mobileupdate.nvidia.com"
+GROUPS="NVIDIA App::nvidia.com www.nvidia.com gfe.nvidia.com services.gfe.nvidia.com gfwsl.geforce.com gfe.geforce.com images.nvidia.com images.nvidiagrid.net img.nvidiagrid.net assets.nvidiagrid.net rds-assets.nvidia.com;;Drivers::download.nvidia.com us.download.nvidia.com international.download.nvidia.com ota.nvidia.com ota-downloads.nvidia.com;;Authentication::account.nvidia.com accounts.nvgs.nvidia.com accounts.nvgs.nvidia.cn login.nvgs.nvidia.com login.nvgs.nvidia.cn;;Telemetry / Analytics::telemetry.nvidia.com telemetry.gfe.nvidia.com events.gfe.nvidia.com ls.dtrace.nvidia.com nvidia.tt.omtrdc.net;;CDN / Content::images.nvidia.com images.nvidiagrid.net img.nvidiagrid.net assets.nvidiagrid.net rds-assets.nvidia.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Reddit
+PRIMARY_DOMAIN=reddit.com
+DESCRIPTION=Reddit web
+DOMAINS="reddit.com www.reddit.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Twitch
+PRIMARY_DOMAIN=twitch.tv
+DESCRIPTION=Twitch web
+DOMAINS="twitch.tv www.twitch.tv"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+
+SERVICE=Steam
+PRIMARY_DOMAIN=steampowered.com
+DESCRIPTION=Steam web/store
+DOMAINS="steampowered.com store.steampowered.com steamcommunity.com"
+TCP_PORTS="80 443"
+UDP_PORTS="443"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+EOF2
+    [ -f "$DOMAIN_SOURCES" ] || cat > "$DOMAIN_SOURCES" <<'EOF2'
+# service|raw URL|filter|required sentinel domains
+YouTube|https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/youtube.lst|all|youtube.com,googlevideo.com,ytimg.com
+Discord|https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/discord.lst|all|discord.com,discordapp.com
+Telegram|https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/telegram.lst|all|telegram.org,t.me
+Instagram|https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/meta.lst|instagram|instagram.com,fbcdn.net
+TikTok|https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Services/tiktok.lst|all|tiktok.com,tiktokcdn.com
+EOF2
+    [ -f "$CUSTOM_SERVICES" ] || : > "$CUSTOM_SERVICES"
+    [ -f "$ETC/external-tests.conf" ] || cat > "$ETC/external-tests.conf" <<'EOF2'
+# zapret-test 0.6.4.1
+# Native OpenWrt availability diagnostics are used instead of executing
+# third-party VPS benchmark scripts directly.
+EOF2
+}
+
+parse_services() {
+    cat "$SERVICE_DB" "$CUSTOM_SERVICES" 2>/dev/null | awk '
+    function emit(){ if(s!=""){ print s "|" d "|" dom "|" tcp "|" udp "|" http "|" https "|" quic "|" groups } s=d=dom=tcp=udp=http=https=quic=groups="" }
+    /^SERVICE=/{emit(); s=$0; sub(/^SERVICE=/,"",s); gsub(/^"|"$/,"",s); next}
+    /^DESCRIPTION=/{d=$0; sub(/^DESCRIPTION=/,"",d); gsub(/^"|"$/,"",d); next}
+    /^DOMAINS=/{dom=$0; sub(/^DOMAINS=/,"",dom); gsub(/^"|"$/,"",dom); next}
+    /^TCP_PORTS=/{tcp=$0; sub(/^TCP_PORTS=/,"",tcp); gsub(/^"|"$/,"",tcp); next}
+    /^UDP_PORTS=/{udp=$0; sub(/^UDP_PORTS=/,"",udp); gsub(/^"|"$/,"",udp); next}
+    /^HTTP_TEST=/{http=$0; sub(/^HTTP_TEST=/,"",http); next}
+    /^HTTPS_TEST=/{https=$0; sub(/^HTTPS_TEST=/,"",https); next}
+    /^QUIC_TEST=/{quic=$0; sub(/^QUIC_TEST=/,"",quic); next}
+    /^GROUPS=/{groups=$0; sub(/^GROUPS=/,"",groups); gsub(/^"|"$/,"",groups); next}
+    END{emit()}'
+}
+
+service_record() { parse_services | grep -F "$1|" | head -n1; }
+
+service_primary_domain() {
+    svc="$1"
+    awk -v svc="$svc" '
+        /^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc); next}
+        in_s && /^PRIMARY_DOMAIN=/{x=$0; sub(/^PRIMARY_DOMAIN=/,"",x); gsub(/^"|"$/,"",x); print x; exit}
+    ' "$SERVICE_DB" 2>/dev/null
+}
+
+translate_group_name() {
+    _gn="$1"
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        case "$_gn" in
+            "NVIDIA App") echo 'NVIDIA App' ;;
+            "Drivers") echo 'Драйверы' ;;
+            "Authentication") echo 'Авторизация' ;;
+            "Telemetry / Analytics") echo 'Телеметрия / аналитика' ;;
+            "CDN / Content") echo 'CDN / контент' ;;
+            *) echo "$_gn" ;;
+        esac
+    else
+        echo "$_gn"
+    fi
+}
+
+sync_domain_lists() {
+    ensure_default_files
+    [ "${ENABLE_LIST_AUTOUPDATE:-1}" = 0 ] && { say "$(t LIST_DISABLED)"; SERVICE_DB="$SERVICES"; return 0; }
+    mkdir -p "$DOMAIN_LIST_DIR" "$RUN/lists" 2>/dev/null || true
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then SERVICE_DB="$SERVICES"; return 0; fi
+    say "$(t LIST_UPDATE)"
+    [ -f "$DOMAIN_SOURCES" ] || { SERVICE_DB="$SERVICES"; return 0; }
+    while IFS='|' read -r svc url filter required; do
+        case "$svc" in ''|\#*) continue;; esac
+        cache="$DOMAIN_LIST_DIR/${svc}.lst"; tmp="$RUN/lists/${svc}.tmp"; ok=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 5 --max-time 8 "$url" -o "$tmp" 2>/dev/null && ok=1
+        fi
+        if [ "$ok" -ne 1 ] && command -v wget >/dev/null 2>&1; then
+            wget -q -T 8 -O "$tmp" "$url" && ok=1
+        fi
+        source_valid=0
+        if [ "$ok" = 1 ]; then
+            normalized="$RUN/lists/${svc}.normalized"
+            awk 'NF && $1 !~ /^#/ && $1 !~ /^;/ {gsub(/^\*\./,"",$1); print tolower($1)}' "$tmp" | sort -u > "$normalized"
+            valid_count=$(awk '$1 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/ {n++} END{print n+0}' "$normalized" 2>/dev/null)
+            [ "$valid_count" -ge 2 ] && source_valid=1
+            oldifs="$IFS"; IFS=','
+            for sentinel in $required; do
+                needle="$(printf '%s' "$sentinel" | tr '[:upper:]' '[:lower:]')"
+                grep -Fxq "$needle" "$normalized" 2>/dev/null || { source_valid=0; break; }
+            done
+            IFS="$oldifs"
+        fi
+        if [ "$source_valid" = 1 ]; then
+            old_sha=""
+            [ -s "$cache" ] && old_sha="$(sha256sum "$cache" 2>/dev/null | awk '{print $1}')"
+            awk -v filter="$filter" 'NF && $1 !~ /^#/ && $1 !~ /^;/ {gsub(/^\*\./,"",$1); v=tolower($1); valid=(v ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/); if (valid && filter=="all") print v; else if (valid && filter=="instagram" && (v ~ /instagram/ || v=="ig.me" || v ~ /(^|\.)fbcdn\.net$/ || v ~ /(^|\.)fbsbx\.com$/)) print v}' "$tmp" | sort -u > "$cache"
+            rm -f "$tmp" "$normalized"
+            cnt=$(wc -l < "$cache" 2>/dev/null | tr -d ' ')
+            new_sha="$(sha256sum "$cache" 2>/dev/null | awk '{print $1}')"
+            sync_time="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+            printf '%s|%s|%s|%s\n' "$svc" "$sync_time" "$cnt" "$new_sha" > "$DOMAIN_LIST_DIR/${svc}.meta"
+            if [ -n "$old_sha" ] && [ "$old_sha" = "$new_sha" ]; then
+                [ "${LANG_MODE:-RU}" = RU ] && printf '  [OK] %s — %s доменов — без изменений\n' "$svc" "$cnt" || printf '  [OK] %s — %s domains — unchanged\n' "$svc" "$cnt"
+            else
+                [ "${LANG_MODE:-RU}" = RU ] && printf '  [ОБНОВЛЕНО] %s — %s доменов — %s\n' "$svc" "$cnt" "$sync_time" || printf '  [UPDATED] %s — %s domains — %s\n' "$svc" "$cnt" "$sync_time"
+            fi
+        elif [ -s "$cache" ]; then
+            cache_valid=1
+            cache_count=$(awk '$1 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/ {n++} END{print n+0}' "$cache" 2>/dev/null)
+            [ "$cache_count" -ge 2 ] || cache_valid=0
+            oldifs="$IFS"; IFS=','
+            for sentinel in $required; do needle="$(printf '%s' "$sentinel" | tr '[:upper:]' '[:lower:]')"; grep -Fxq "$needle" "$cache" 2>/dev/null || { cache_valid=0; break; }; done
+            IFS="$oldifs"
+            if [ "$cache_valid" = 1 ]; then
+                rm -f "$tmp"; cnt=$(wc -l < "$cache" 2>/dev/null | tr -d ' '); [ "${LANG_MODE:-RU}" = RU ] && printf '  [CACHE] %s — %s доменов\n' "$svc" "$cnt" || printf '  [CACHE] %s — %s domains\n' "$svc" "$cnt"
+            else
+                rm -f "$tmp" "$cache"; [ "${LANG_MODE:-RU}" = RU ] && printf '  [WARN] %s — повреждённый кэш удалён, используется встроенный список\n' "$svc" || printf '  [WARN] %s — invalid cache removed, using bundled list\n' "$svc"
+            fi
+        else
+            rm -f "$tmp"; [ "${LANG_MODE:-RU}" = RU ] && printf '  [WARN] %s — список недоступен, используется встроенный список\n' "$svc" || printf '  [WARN] %s — source unavailable, using bundled list\n' "$svc"
+        fi
+    done < "$DOMAIN_SOURCES"
+    cp "$SERVICES" "$RUN/services-runtime.conf"
+    for svc in YouTube Discord Telegram Instagram TikTok; do
+        cache="$DOMAIN_LIST_DIR/${svc}.lst"; [ -s "$cache" ] || continue
+        old="$(awk -v svc="$svc" '/^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc); next} in_s && /^DOMAINS=/{x=$0; sub(/^DOMAINS=/,"",x); gsub(/^"|"$/,"",x); print x; exit}' "$SERVICES")"
+        merged="$(printf '%s\n' $old; cat "$cache")"; merged="$(printf '%s\n' "$merged" | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+        awk -v svc="$svc" -v dom="$merged" '/^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc)} in_s && /^DOMAINS=/{print "DOMAINS=\"" dom "\""; in_s=0; next} {print}' "$RUN/services-runtime.conf" > "$RUN/services-runtime.tmp" && mv "$RUN/services-runtime.tmp" "$RUN/services-runtime.conf"
+    done
+    SERVICE_DB="$RUN/services-runtime.conf"
+}
+print_service_groups() {
+    svc="$1"
+    rec="$(service_record "$svc")"
+    IFS='|' read -r _ _ domains _ _ _ _ _ groups <<EOF2
+$rec
+EOF2
+    # All service/domain displays are intentionally flat. GROUPS remains internal for
+    # dedicated diagnostics, but the common service/test view never creates sublists.
+    say "    $(t DOMAINS): $domains"
+}
+
+select_services_interactive() {
+    ensure_default_files
+    clear 2>/dev/null || true
+    i=1
+    : > "$STATE/services.list"
+    : > "$STATE/service-menu"
+    # A new service selection starts a new test context; never reuse a previous blockcheck target.
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    say '=============================================='
+    say " $(t SELECT_PROFILE)"
+    say '=============================================='
+    menu_file="$RUN/service-menu-source"
+    parse_services > "$menu_file"
+    while IFS='|' read -r s d dom tcp udp ht hts q groups; do
+        [ -n "$s" ] || continue
+        printf '[%d] %s\n' "$i" "$s"
+        echo "$i|$s" >> "$STATE/service-menu"
+        i=$((i+1))
+    done < "$menu_file"
+    if [ "${LANG_MODE:-RU}" = RU ]; then say '[A] Все сервисы'; say '[C] Поиск по ключевому слову'; else say '[A] All services'; say '[C] Search by keyword'; fi
+    say "[0] $(t EXIT)"
+    t SELECT_SERVICES
+    read answer || answer=''
+    case "$answer" in
+        0) rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"; return 1;;
+        c|C)
+            say ''
+            t KEYWORD_INFO
+            say ''
+            t KEYWORD_SEARCH
+            say '------------------------------------------------------------'
+            t KEYWORD_PROMPT
+            read keyword || keyword=''
+            discover_keyword_service "$keyword" || return 1
+            ;;
+        all|ALL|All|a|A)
+            awk -F'|' '{print $2}' "$STATE/service-menu" > "$STATE/services.list"
+            ;;
+        *)
+            oldIFS=$IFS
+            IFS=','
+            for x in $answer; do
+                x=$(printf '%s' "$x" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                awk -F'|' -v n="$x" '$1==n{print $2}' "$STATE/service-menu" >> "$STATE/services.list"
+            done
+            IFS=$oldIFS
+            ;;
+    esac
+    if [ ! -s "$STATE/services.list" ]; then
+        t NO_SERVICES
+        return 1
+    fi
+    # Selected services are shown once in the subsequent baseline preparation block.
+}
+
+discover_keyword_service() {
+    keyword="$1"
+    keyword=$(printf '%s' "$keyword" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$keyword" in
+        ''|*[!a-z0-9._-]*) t INVALID; return 1 ;;
+    esac
+    [ "${#keyword}" -ge 3 ] || { t KEYWORD_TOO_SHORT; return 1; }
+    domains_file="$STATE/keyword-domains"
+    : > "$domains_file"
+    case "$keyword" in
+        nvidia|nvidia.com)
+            rec="$(parse_services | grep -F 'NVIDIA|' | head -n1)"
+            printf '%s\n' "$rec" | awk -F'|' '{print $3}' | tr ' ' '\n' >> "$domains_file"
+            ;;
+    esac
+    if has curl && has jq; then
+        search_json="$(curl -fsSL --connect-timeout 5 --max-time 20 --get \
+            --data-urlencode "q=%$keyword%" --data-urlencode 'output=json' 'https://crt.sh/' 2>/dev/null || true)"
+        if [ -n "$search_json" ]; then
+            printf '%s' "$search_json" | jq -r '.[]?.name_value // empty' 2>/dev/null \
+                | tr '\r' '\n' \
+                | sed 's/^\*\.//; s/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' \
+                | tr '[:upper:]' '[:lower:]' \
+                | grep -E '(^|\.)[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' \
+                | grep -F "$keyword" \
+                | sort -u >> "$domains_file" || true
+        fi
+    fi
+    tmpfile="$domains_file.tmp"
+    sort -u "$domains_file" 2>/dev/null | head -n 100 > "$tmpfile" 2>/dev/null || true
+    mv "$tmpfile" "$domains_file" 2>/dev/null || true
+    count="$(wc -l < "$domains_file" 2>/dev/null | tr -d ' ')"
+    [ -n "$count" ] || count=0
+    printf '%s%d\n' "$(t KEYWORD_FOUND)" "$count"
+    [ "$count" -gt 0 ] || { t KEYWORD_NORESULTS; return 1; }
+    say '------------------------------------------------------------'
+    cat "$domains_file"
+    say '------------------------------------------------------------'
+    t KEYWORD_NOTE
+    svc="Keyword:$keyword"
+    {
+        printf 'SERVICE=%s\n' "$svc"
+        printf 'DESCRIPTION=Keyword search result\n'
+        printf 'DOMAINS="%s"\n' "$(tr '\n' ' ' < "$domains_file" | sed 's/[[:space:]]*$//')"
+        printf 'TCP_PORTS="80 443"\nUDP_PORTS="443"\nHTTP_TEST=1\nHTTPS_TEST=1\nQUIC_TEST=1\n\n'
+    } > "$RUNTIME_SERVICES.tmp"
+    mv "$RUNTIME_SERVICES.tmp" "$RUNTIME_SERVICES"
+    printf '%s\n' "$svc" > "$STATE/services.list"
+}
+
+valid_domain() {
+    _vd="$1"
+    case "$_vd" in
+        ''|*'://'*|*'/'*|*':'*|*' '*|.*|*.|*..*) return 1 ;;
+    esac
+    printf '%s' "$_vd" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$'
+}
+
+validate_domains() {
+    _invalid=""
+    for _vd in $1; do
+        _nd=$(printf '%s' "$_vd" | tr '[:upper:]' '[:lower:]')
+        if ! valid_domain "$_nd"; then
+            _invalid="$_invalid $_vd"
+        fi
+    done
+    if [ -n "$_invalid" ]; then
+        say "$(t DOMAIN_INVALID)"
+        say "$(t DOMAIN_INVALID_LIST)$_invalid"
+        return 1
+    fi
+    return 0
+}
+
+normalize_domains() {
+    _out=""
+    for _vd in $1; do
+        _nd=$(printf '%s' "$_vd" | tr '[:upper:]' '[:lower:]')
+        case " $_out " in
+            *" $_nd "*) ;;
+            *) _out="$_out $_nd";;
+        esac
+    done
+    printf '%s\n' "$_out" | sed 's/^ *//; s/  */ /g'
+}
+
+get_custom_record_block() {
+    want="$1"
+    awk -v want="$want" '
+      /^SERVICE=/ {
+        cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur)
+        in_block=(cur==want)
+        if (in_block) print
+        next
+      }
+      in_block {print}
+    ' "$CUSTOM_SERVICES" 2>/dev/null
+}
+
+custom_service_exists() {
+    get_custom_record_block "$1" | grep -q '^SERVICE='
+}
+
+list_custom_services() {
+    i=1
+    : > "$RUN/custom-menu"
+    parse_services > "$RUN/custom-menu-source"
+    while IFS='|' read -r s d dom tcp udp ht hts q groups; do
+        [ -n "$s" ] || continue
+        case "$s" in Keyword:*) continue;; esac
+        if custom_service_exists "$s"; then
+            printf '%d|%s\n' "$i" "$s" >> "$RUN/custom-menu"
+            printf '[%d] %s\n' "$i" "$s"
+            i=$((i+1))
+        fi
+    done < "$RUN/custom-menu-source"
+}
+
+read_custom_field() {
+    get_custom_record_block "$1" | sed -n "s/^$2=\"\(.*\)\"$/\1/p"
+}
+
+write_custom_record() {
+    service="$1"; domains="$2"; tcp="$3"; udp="$4"
+    tmp="$CUSTOM_SERVICES.tmp.$$"
+    awk -v want="$service" '
+      /^SERVICE=/ {
+        cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur)
+        if (cur==want) { skip=1; next }
+        if (skip) skip=0
+      }
+      !skip {print}
+    ' "$CUSTOM_SERVICES" > "$tmp"
+    cat >> "$tmp" <<EOF2
+
+SERVICE=$service
+DESCRIPTION=Custom service
+DOMAINS="$domains"
+TCP_PORTS="$tcp"
+UDP_PORTS="$udp"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+EOF2
+    mv "$tmp" "$CUSTOM_SERVICES"
+}
+
+edit_custom_service() {
+    svc="$1"
+    old_d="$(read_custom_field "$svc" DOMAINS)"
+    old_tcp="$(read_custom_field "$svc" TCP_PORTS)"
+    old_udp="$(read_custom_field "$svc" UDP_PORTS)"
+    while :; do
+        if [ "${LANG_MODE:-RU}" = RU ]; then printf 'Домены [%s]: ' "$old_d"; else printf 'Domains [%s]: ' "$old_d"; fi; read d || d="$old_d"
+        [ -n "$d" ] || d="$old_d"
+        validate_domains "$d" && break
+        t EDIT_DOMAIN_ERROR
+    done
+    norm="$(normalize_domains "$d")"
+    [ -n "$norm" ] || { t DOMAIN_INVALID; return 1; }
+    if [ "${LANG_MODE:-RU}" = RU ]; then printf 'TCP-порты [%s]: ' "${old_tcp:-443}"; else printf 'TCP ports [%s]: ' "${old_tcp:-443}"; fi; read tcp || tcp="$old_tcp"; [ -n "$tcp" ] || tcp=443
+    if [ "${LANG_MODE:-RU}" = RU ]; then printf 'UDP-порты [%s]: ' "${old_udp:-443}"; else printf 'UDP ports [%s]: ' "${old_udp:-443}"; fi; read udp || udp="$old_udp"; [ -n "$udp" ] || udp=443
+    write_custom_record "$svc" "$norm" "$tcp" "$udp"
+    say "$(t EDITED): $svc"
+}
+
+delete_custom_service() {
+    svc="$1"
+    printf "$(t DELETE_CONFIRM)" "$svc"
+    read ans || ans=n
+    case "$ans" in
+        y|Y)
+            tmp="$CUSTOM_SERVICES.tmp.$$"
+            awk -v want="$svc" '
+              /^SERVICE=/ {
+                cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur)
+                if (cur==want) {skip=1; next}
+                if (skip) skip=0
+              }
+              !skip {print}
+            ' "$CUSTOM_SERVICES" > "$tmp"
+            mv "$tmp" "$CUSTOM_SERVICES"
+            say "$(t DELETED): $svc"
+            ;;
+        *) t DELETE_CANCEL ;;
+    esac
+}
+
+manage_custom_services() {
+    ensure_default_files
+    while :; do
+        clear 2>/dev/null || true
+        say '=============================================='
+        say " $(t MANAGE_CUSTOM)"
+        say '=============================================='
+        list_custom_services
+        if [ ! -s "$RUN/custom-menu" ]; then
+            say "$(t NO_CUSTOM)"
+            say "[0] $(t EXIT)"
+            ui_pause
+            return 0
+        fi
+        t EDIT_SELECTED
+        t EDIT_NUMBER
+        t DELETE_NUMBER
+        say "[0] $(t EXIT)"
+        t SELECT; read action || return 0
+        case "$action" in
+            [0-9]*)
+                svc=$(awk -F'|' -v n="$action" '$1==n{print $2; exit}' "$RUN/custom-menu")
+                [ -n "$svc" ] || { say "$(t INVALID)"; ui_pause; continue; }
+                edit_custom_service "$svc"; ui_pause;;
+            e|E)
+                t SELECT; read n || n=''
+                svc=$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/custom-menu")
+                [ -n "$svc" ] || { say "$(t INVALID)"; ui_pause; continue; }
+                edit_custom_service "$svc"; ui_pause;;
+            d|D)
+                t SELECT; read n || n=''
+                svc=$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/custom-menu")
+                [ -n "$svc" ] || { say "$(t INVALID)"; ui_pause; continue; }
+                delete_custom_service "$svc"; ui_pause;;
+            0|q|Q) return 0;;
+            *) say "$(t INVALID)"; ui_pause;;
+        esac
+    done
+}
+
+add_custom() {
+    t ADD_NAME; read s || s=''
+    [ -n "$s" ] || { say "$(t INVALID)"; return 1; }
+    custom_service_exists "$s" && { t DUP_CUSTOM; return 1; }
+    while :; do
+        t ADD_DOMAINS; read d || d=''
+        validate_domains "$d" && break
+        t DOMAIN_RETRY
+        case "$d" in 0) return 1;; esac
+    done
+    norm="$(normalize_domains "$d")"
+    [ -n "$norm" ] || { t DOMAIN_INVALID; return 1; }
+    t ADD_TCP; read tcp || tcp=''; [ -n "$tcp" ] || tcp=443
+    t ADD_UDP; read udp || udp=''; [ -n "$udp" ] || udp=443
+    cat >> "$CUSTOM_SERVICES" <<EOF2
+
+SERVICE=$s
+DESCRIPTION=Custom service
+DOMAINS="$norm"
+TCP_PORTS="$tcp"
+UDP_PORTS="$udp"
+HTTP_TEST=1
+HTTPS_TEST=1
+QUIC_TEST=1
+EOF2
+    printf "%s%s\n" "$(t ADDED)" "$s"
+}
+
+set_first_blockcheck_target() {
+    ensure_default_files
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    while IFS= read -r svc; do
+        [ -n "$svc" ] || continue
+        dom="$(service_primary_domain "$svc" | head -n1)"
+        if [ -n "$dom" ] && valid_domain "$dom"; then
+            printf '%s\n' "$svc" > "$STATE/blockcheck.service"
+            printf '%s\n' "$dom" > "$STATE/blockcheck.domain"
+            return 0
+        fi
+        rec="$(service_record "$svc")"
+        IFS='|' read -r _ _ doms _ _ _ _ _ groups <<EOF2
+$rec
+EOF2
+        for d in $doms; do
+            if valid_domain "$d"; then
+                printf '%s\n' "$svc" > "$STATE/blockcheck.service"
+                printf '%s\n' "$d" > "$STATE/blockcheck.domain"
+                return 0
+            fi
+        done
+        if [ -n "${groups:-}" ]; then
+            oldifs="$IFS"; IFS=';'
+            for grp in $groups; do
+                gdoms="${grp#*::}"
+                for d in $gdoms; do
+                    if valid_domain "$d"; then
+                        printf '%s\n' "$svc" > "$STATE/blockcheck.service"
+                        printf '%s\n' "$d" > "$STATE/blockcheck.domain"
+                        IFS="$oldifs"
+                        return 0
+                    fi
+                done
+            done
+            IFS="$oldifs"
+        fi
+    done < "$STATE/services.list"
+    return 1
+}
+
+select_blockcheck_target() {
+    ensure_default_files
+    if [ ! -s "$STATE/services.list" ]; then
+        select_services_interactive || return 1
+    fi
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    clear 2>/dev/null || true
+    say '=============================================='
+    say " $(t BLOCKCHECK_MENU)"
+    say '=============================================='
+    t BLOCKCHECK_TARGET_INFO1
+    t BLOCKCHECK_TARGET_INFO2
+    t BLOCKCHECK_TARGET_INFO3
+    say ''
+    parse_services > "$RUN/blockcheck-service-source"
+    i=1; : > "$RUN/blockcheck-service-menu"
+    while IFS='|' read -r svc desc dom tcp udp ht hts q groups; do
+        [ -n "$svc" ] || continue
+        printf '[%d] %s\n' "$i" "$svc"
+        printf '%d|%s\n' "$i" "$svc" >> "$RUN/blockcheck-service-menu"
+        i=$((i+1))
+    done < "$RUN/blockcheck-service-source"
+    say "[0] $(t EXIT)"
+    t SELECT_BC_SERVICE; read n || n=''
+    case "$n" in 0|q|Q) return 1;; esac
+    svc=$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/blockcheck-service-menu")
+    [ -n "$svc" ] || { say "$(t INVALID)"; return 1; }
+    printf '%s\n' "$svc" > "$STATE/blockcheck.service"
+    rec="$(service_record "$svc")"
+    IFS='|' read -r _ _ domains _ _ _ _ _ groups <<EOF2
+$rec
+EOF2
+    primary="$(service_primary_domain "$svc" | head -n1)"
+    valid_list=''
+    [ -n "$primary" ] && valid_domain "$primary" && valid_list="$primary"
+    for d in $domains; do
+        valid_domain "$d" || continue
+        case " $valid_list " in *" $d "*) :;; *) valid_list="$valid_list $d";; esac
+    done
+    [ -n "$valid_list" ] || { t NO_VALID_BC_DOMAINS; return 1; }
+    say ''
+    say "TARGETS: $svc"
+    idx=0
+    for d in $valid_list; do
+        idx=$((idx+1))
+        if [ "$idx" -eq 1 ]; then printf '  [%02d] → %s\n' "$idx" "$d"; else printf '  [%02d]   %s\n' "$idx" "$d"; fi
+    done
+    target="$primary"
+    [ -n "$target" ] || target="$(printf '%s\n' $valid_list | head -n1)"
+    printf '%s\n' "$target" > "$STATE/blockcheck.domain"
+    t AUTO_TARGET; printf '%s\n' "$target"
+}
+
+# ---------- probes ----------
+# ---------- probes ----------
+classify_curl() {
+    rc="$1"
+    case "$rc" in
+      0) echo PASS;;
+      6) echo DNS_FAILURE;;
+      7) echo TCP_FAILURE;;
+      28) echo TIMEOUT;;
+      35) echo TLS_FAILURE;;
+      47) echo HTTP_FAILURE;;
+      1|2|3|4) echo UNSUPPORTED;;
+      *) echo UNKNOWN;;
+    esac
+}
+
+curl_probe() {
+    url="$1"; extra="$2"; hdr="$RUN/hdr.$$.txt"
+    start=$(now_ms)
+    # shellcheck disable=SC2086
+    "$CURL" -k -sS -A "$USER_AGENT" -D "$hdr" -o /dev/null --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" $extra "$url" >/dev/null 2>"$RUN/curl.err"
+    rc=$?; end=$(now_ms); ms=$((end-start));
+    code="$(sed -n '1s/^HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' "$hdr" 2>/dev/null | head -n1)"
+    loc="$(sed -n 's/^[Ll]ocation:[[:space:]]*//p' "$hdr" 2>/dev/null | head -n1 | tr -d '\r')"
+    rm -f "$hdr"
+    printf '%s|%s|%s|%s\n' "$rc" "$(classify_curl "$rc")" "$ms" "${code:-NA}|${loc:-}"
+    return 0
+}
+
+dns_probe() {
+    host="$1"
+    _ip=""
+    if has dig; then
+        _ip="$(dig +short "$host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)"
+    elif has nslookup; then
+        _ip="$(nslookup "$host" 2>/dev/null | sed -n 's/.*Address: *\([0-9][0-9.]*\).*/\1/p' | head -n1 || true)"
+    elif has host; then
+        _ip="$(host "$host" 2>/dev/null | awk '/has address/{print $4; exit}' || true)"
+    else
+        echo UNAVAILABLE; return 0
+    fi
+    [ -n "$_ip" ] || { echo DNS_FAILURE; return 0; }
+    case "$_ip" in
+        127.0.0.42|198.18.*|198.19.*) echo "DNS_SYNTHETIC|$_ip"; return 0;;
+    esac
+    echo "PASS|$_ip"
+}
+
+dns_configured_resolvers() {
+    _f="/tmp/resolv.conf.d/resolv.conf.auto"
+    [ -s "$_f" ] || _f="/etc/resolv.conf"
+    awk '/^nameserver /{print $2}' "$_f" 2>/dev/null | head -n5
+}
+
+is_synthetic_ip() {
+    case "$1" in 127.0.0.42|198.18.*|198.19.*) return 0;; esac
+    return 1
+}
+
+dns_integrity_probe() {
+    _host="$1"; _local=""; _up=""; _doh=""; _up_server=""
+    if has dig; then
+        _local="$(dig @127.0.0.1 +time=2 +tries=1 +short "$_host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)"
+        while IFS= read -r _r; do
+            [ -n "$_r" ] || continue
+            case "$_r" in 127.0.0.1|::1) continue;; esac
+            _up="$(dig @"$_r" +time=2 +tries=1 +short "$_host" A 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)"
+            [ -n "$_up" ] && { _up_server="$_r"; break; }
+        done <<EOF2
+$(dns_configured_resolvers)
+EOF2
+    fi
+    _kind=DNS_FAILURE
+    if [ -n "$_local" ]; then
+        if is_synthetic_ip "$_local"; then _kind=DNS_SYNTHETIC; else _kind=PASS; fi
+    fi
+    if [ "$_kind" = DNS_SYNTHETIC ] || [ -z "$_up" ]; then
+        if has curl && has jq; then
+            # Try configured DoH first, then independent public resolvers.
+            doh_urls="${DOH_URL:-https://cloudflare-dns.com/dns-query}|https://dns.google/resolve?name=$_host&type=A|https://dns.quad9.net/dns-query?name=$_host&type=A"
+            oldifs="$IFS"; IFS='|'
+            for _du in $doh_urls; do
+                case "$_du" in *dns.google*)
+                    _doh="$(curl -4 -fsS --connect-timeout 3 --max-time 6 -H 'accept: application/dns-json' "$_du" 2>/dev/null | jq -r '.Answer[]?.data' 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)";;
+                *)
+                    _doh="$(curl -4 -fsS --connect-timeout 3 --max-time 6 -H 'accept: application/dns-json' "$_du" 2>/dev/null | jq -r '.Answer[]?.data' 2>/dev/null | grep -E '^[0-9.]+$' | head -n1 || true)";;
+                esac
+                [ -n "$_doh" ] && break
+            done
+            IFS="$oldifs"
+        fi
+    fi
+    printf '%s|%s|%s|%s|%s\n' "$_kind" "$_local" "$_up" "$_doh" "$_up_server"
+}
+
+tcp_probe() {
+    host="$1"; port="$2"
+    # zapret2 upstream explicitly prefers ncat; BusyBox nc is unsupported.
+    if has ncat; then
+        ncat -z -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
+    elif has nc && ! nc 2>&1 | grep -qi busybox; then
+        nc -z -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
+    else
+        echo UNAVAILABLE
+    fi
+}
+
+tls_probe() {
+    host="$1"; ver="$2"
+    [ -x "$OPENSSL" ] || { echo UNAVAILABLE; return; }
+    start=$(now_ms)
+    case "$ver" in
+      1.2) "$OPENSSL" s_client -connect "$host:443" -servername "$host" -tls1_2 -brief </dev/null >/dev/null 2>"$RUN/openssl.err";;
+      1.3) "$OPENSSL" s_client -connect "$host:443" -servername "$host" -tls1_3 -brief </dev/null >/dev/null 2>"$RUN/openssl.err";;
+      *) echo UNAVAILABLE; return;;
+    esac
+    rc=$?; end=$(now_ms); ms=$((end-start));
+    [ "$rc" = 0 ] && echo "PASS|$ms" || echo "TLS${ver}_FAILURE|$ms"
+}
+
+http3_capable() {
+    "$CURL" --help 2>&1 | grep -q -- '--http3' && return 0
+    "$CURL" --version 2>&1 | grep -qi 'HTTP3' && return 0
+    return 1
+}
+
+host_is_ipv6() { echo "$1" | grep -q ':'; }
+resolve_ips() {
+    host="$1"
+    if has nslookup; then nslookup "$host" 2>/dev/null | awk '/^Address: /{print $2}' | tr '\n' ' '
+    elif has host; then host "$host" 2>/dev/null | awk '/has address|has IPv6 address/{print $NF}' | tr '\n' ' '
+    fi
+}
+
+resolve_ips_for_strategy() {
+    host="$1"
+    local_result="$(dns_probe "$host" 2>/dev/null || true)"
+    case "$local_result" in
+        PASS\|*) resolve_ips "$host" ;;
+        DNS_SYNTHETIC*|DNS_FAILURE*)
+            doh_result="$(dns_integrity_probe "$host" 2>/dev/null || true)"
+            doh_ip="$(printf '%s' "$doh_result" | cut -d'|' -f4)"
+            if [ -n "$doh_ip" ] && ! is_synthetic_ip "$doh_ip"; then
+                printf '%s ' "$doh_ip"
+            else
+                resolve_ips "$host"
+            fi
+            ;;
+        *) resolve_ips "$host" ;;
+    esac
+}
+
+# ---------- baseline/results ----------
+write_json_header() {
+    cat > "$REPORT_JSON" <<EOF2
+{
+  "system":{"kernel":"$(json_escape "$KERNEL")","arch":"$(json_escape "$ARCH")","openwrt":"$(json_escape "$OPENWRT_RELEASE")","firewall":"$(json_escape "$FW")","dns":"$(json_escape "$DNS_SERVERS")","ipv6":"$(json_escape "$IPV6_STATE")"},
+  "engine":{},"selected_services":[],"baseline":{},"strategies":[],"best_global":null,"best_per_service":{},"failures":[],"restore_status":"UNKNOWN"
+}
+EOF2
+}
+
+report_init() {
+    : > "$REPORT_TXT"
+    write_json_header
+    {
+      echo '=================================================='
+      echo 'ZAPRET DIAGNOSTIC REPORT'
+      echo '=================================================='
+      echo "DATE: $(date)"
+      echo "SYSTEM: $SYSTEM"
+      echo "KERNEL: $KERNEL"
+      echo "ARCH: $ARCH"
+      echo "DEVICE: ${DEVICE_MODEL:-unknown}"
+      echo "OPENWRT: $OPENWRT_RELEASE"
+      echo "FIREWALL: $FW"
+      echo "DNS: $DNS_SERVERS"
+      echo "IPV6: $IPV6_STATE"
+      echo "CURL: $($CURL --version 2>/dev/null | head -n1)"
+      echo "OPENSSL: $($OPENSSL version 2>/dev/null || echo unavailable)"
+      echo "CLIENT: $TEST_CLIENT"
+      echo "EXTERNAL_DIAGNOSTICS: ${ENABLE_EXTERNAL_TESTS:-1}"
+      echo
+    } >> "$REPORT_TXT"
+}
+
+baseline_worker() {
+    : > "$STATE/baseline"
+    : > "$RUN/baseline-progress"
+    progress_n=0
+    progress_total=0
+    _seen_domains=''
+    while IFS= read -r _svc; do
+        [ -n "$_svc" ] || continue
+        _rec="$(service_record "$_svc")"
+        IFS='|' read -r _ _desc _domains _tcp _udp _htt _https _quic <<EOF2
+$_rec
+EOF2
+        for _d in $_domains; do
+            [ -n "$_d" ] || continue
+            case " $_seen_domains " in *" $_d "*) continue;; esac
+            _seen_domains="$_seen_domains $_d"
+            progress_total=$((progress_total+1))
+        done
+    done < "$STATE/services.list"
+    {
+      echo '=================================================='
+      echo 'BASELINE'
+      echo '=================================================='
+    } >> "$REPORT_TXT"
+    while IFS= read -r s; do
+        rec="$(service_record "$s")"
+        IFS='|' read -r _ desc domains tcp udp htt https quic <<EOF2
+$rec
+EOF2
+        echo "[$s]" >> "$REPORT_TXT"
+        for d in $domains; do
+            progress_n=$((progress_n+1))
+            printf '%s|%s|%s|%s\n' "$progress_n" "$progress_total" "$d" "DNS" > "$RUN/baseline-progress"
+            r="$(dns_integrity_probe "$d")"; echo "$s|$d|DNS|$r" >> "$STATE/baseline"; printf '%s|%s|%s|%s\n' "$progress_n" "$progress_total" "$d" "DNS" > "$RUN/baseline-progress"
+            printf '  %-28s DNS=%s\n' "$d" "$r" >> "$REPORT_TXT"
+            dnskind="${r%%|*}"
+            if [ "$dnskind" != DNS_SYNTHETIC ] && [ "$dnskind" != DNS_FAILURE ]; then
+                [ "$htt" = 1 ] && { printf '%s|%s|%s|%s\n' "$progress_n" "$progress_total" "$d" "HTTP" > "$RUN/baseline-progress"; r="$(curl_probe "http://$d" "")"; echo "$s|$d|HTTP|$r" >> "$STATE/baseline"; printf '  %-28s HTTP=%s\n' "$d" "$r" >> "$REPORT_TXT"; }
+                [ "$https" = 1 ] && { printf '%s|%s|%s|%s\n' "$progress_n" "$progress_total" "$d" "HTTPS" > "$RUN/baseline-progress"; r="$(curl_probe "https://$d" "")"; echo "$s|$d|HTTPS|$r" >> "$STATE/baseline"; printf '  %-28s HTTPS=%s\n' "$d" "$r" >> "$REPORT_TXT"; }
+            fi
+            [ "$ENABLE_HTTP3" = 1 ] && [ "$quic" = 1 ] && {
+                if http3_capable; then r="$(curl_probe "https://$d" "--http3-only")"; else r='2|UNAVAILABLE|0|NA|'; fi
+                echo "$s|$d|HTTP3|$r" >> "$STATE/baseline"
+            }
+        done
+    done < "$STATE/services.list"
+}
+
+print_baseline_results() {
+    say ''
+    say '============================================================'
+    say " $( [ "${LANG_MODE:-RU}" = RU ] && echo 'РЕЗУЛЬТАТ БАЗОВОЙ ПРОВЕРКИ' || echo 'BASELINE RESULTS' )"
+    say '============================================================'
+    total=0; ok=0; partial=0; bad=0
+    if [ ! -s "$STATE/baseline" ]; then
+        say "  $(t NO_DATA_VIEW)"
+        say '============================================================'
+        return 0
+    fi
+
+    baseline_domain_state() {
+        _bs="$1"; _bd="$2"
+        _dnsr="$(grep -F "$_bs|$_bd|DNS|" "$STATE/baseline" 2>/dev/null | tail -n1 | cut -d'|' -f4-)"
+        _httpsr="$(grep -F "$_bs|$_bd|HTTPS|" "$STATE/baseline" 2>/dev/null | tail -n1 | cut -d'|' -f4-)"
+        _httpr="$(grep -F "$_bs|$_bd|HTTP|" "$STATE/baseline" 2>/dev/null | tail -n1 | cut -d'|' -f4-)"
+        _dnskind="${_dnsr%%|*}"; _dnsrest="${_dnsr#*|}"; _dnsip="${_dnsrest%%|*}"; _dnsup="$(printf '%s' "$_dnsrest" | cut -d'|' -f2)"; _dnsdoh="$(printf '%s' "$_dnsrest" | cut -d'|' -f3)"
+        case "$_dnskind" in
+            PASS)
+                case "$_httpsr" in
+                    *'|PASS|'*) printf 'PASS|';;
+                    *'|TIMEOUT|'*) printf 'TIMEOUT|';;
+                    *'|TCP_FAILURE|'*) printf 'TCP_FAILURE|';;
+                    *'|TLS_FAILURE|'*) printf 'TLS_FAILURE|';;
+                    *'|HTTP_FAILURE|'*) printf 'HTTP_FAILURE|';;
+                    *)
+                        case "$_httpr" in
+                            *'|PASS|'*) printf 'PASS|';;
+                            *'|TIMEOUT|'*) printf 'TIMEOUT|';;
+                            *'|TCP_FAILURE|'*) printf 'TCP_FAILURE|';;
+                            *'|DNS_FAILURE|'*) printf 'DNS_FAILURE|';;
+                            *'|HTTP_FAILURE|'*) printf 'HTTP_FAILURE|';;
+                            *) printf 'NO_DATA|';;
+                        esac;;
+                esac;;
+            DNS_FAILURE) printf 'DNS_FAILURE|';;
+            DNS_MISMATCH) printf 'DNS_MISMATCH|%s|%s|%s' "$_dnsip" "$_dnsup" "$_dnsdoh";;
+            DNS_SYNTHETIC) printf 'DNS_SYNTHETIC|%s|%s|%s' "$_dnsip" "$_dnsup" "$_dnsdoh";;
+            *) printf 'NO_DATA|';;
+        esac
+    }
+
+    print_domain_line() {
+        _svc="$1"; _dom="$2"; _tree="$3"; _last="$4"
+        _st="$(baseline_domain_state "$_svc" "$_dom")"
+        _kind="${_st%%|*}"; _detail_extra="${_st#*|}"
+        case "$_kind" in
+            PASS) _mark='✓'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'РАБОТАЕТ' || echo 'WORKS' ); _badge="$(badge "$C_BG_GREEN" "$C_FG_BLACK" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "РАБОТАЕТ" || echo "WORKS" ) ")";;
+            DNS_FAILURE) _mark='✗'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ЗАБЛОКИРОВАНО: DNS' || echo 'BLOCKED: DNS' ); _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ЗАБЛОКИРОВАНО" || echo "BLOCKED" ) ")";;
+            DNS_SYNTHETIC) _mark='✗'; _detail="$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ПЕРЕХВАТ DNS' || echo 'DNS INTERCEPTED' ) ($_detail_extra)"; _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ЗАБЛОКИРОВАНО" || echo "BLOCKED" ) ")";;
+            DNS_MISMATCH) _mark='~'; _detail="$( [ "${LANG_MODE:-RU}" = RU ] && echo 'DNS НЕ СОВПАДАЕТ: локальный/upstream/DoH' || echo 'DNS MISMATCH: local/upstream/DoH' )=$_detail_extra"; _badge="$(badge "$C_BG_YELLOW" "$C_FG_BLACK" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ПРОВЕРИТЬ" || echo "CHECK" ) ")";;
+            TCP_FAILURE) _mark='✗'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ЗАБЛОКИРОВАНО: TCP' || echo 'BLOCKED: TCP' ); _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ЗАБЛОКИРОВАНО" || echo "BLOCKED" ) ")";;
+            TLS_FAILURE) _mark='✗'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ЗАБЛОКИРОВАНО: TLS' || echo 'BLOCKED: TLS' ); _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ЗАБЛОКИРОВАНО" || echo "BLOCKED" ) ")";;
+            TIMEOUT) _mark='✗'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ТАЙМ-АУТ' || echo 'TIMEOUT' ); _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ТАЙМ-АУТ" || echo "TIMEOUT" ) ")";;
+            HTTP_FAILURE) _mark='✗'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'ОШИБКА HTTP' || echo 'HTTP FAILED' ); _badge="$(badge "$C_BG_RED" "$C_FG_WHITE" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "ЗАБЛОКИРОВАНО" || echo "BLOCKED" ) ")";;
+            *) _mark='~'; _detail=$( [ "${LANG_MODE:-RU}" = RU ] && echo 'НЕТ ДАННЫХ' || echo 'NO DATA' ); _badge="$(badge "$C_BG_YELLOW" "$C_FG_BLACK" " $( [ "${LANG_MODE:-RU}" = RU ] && echo "НЕТ ДАННЫХ" || echo "NO DATA" ) ")";;
+        esac
+        printf '%s %s  %s %s\n' "$_tree" "$_dom" "$_badge" "$_detail"
+        case "$_kind" in
+            PASS) ok=$((ok+1));;
+            DNS_FAILURE|DNS_SYNTHETIC|TCP_FAILURE|TLS_FAILURE|TIMEOUT|HTTP_FAILURE) bad=$((bad+1));;
+            DNS_MISMATCH) partial=$((partial+1));;
+            *) partial=$((partial+1));;
+        esac
+        total=$((total+1))
+        echo "$_svc|$_dom|RESULT|$_kind|$_detail" >> "$REPORT_TXT"
+    }
+
+    while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        rec="$(service_record "$s")"
+        IFS='|' read -r _ desc domains tcp udp htt https quic groups <<EOF2
+$rec
+EOF2
+        if [ -n "${groups:-}" ]; then
+            # NVIDIA and other grouped services are rendered exactly like every other
+            # service: one flat domain list with no nested group/sub-list formatting.
+            say "$s"
+            _count=0; _idx=0
+            for d in $domains; do [ -n "$d" ] && _count=$((_count+1)); done
+            for d in $domains; do
+                [ -n "$d" ] || continue
+                _idx=$((_idx+1)); _last=0; [ "$_idx" -eq "$_count" ] && _last=1
+                if [ "$_last" -eq 1 ]; then tree='└─'; else tree='├─'; fi
+                print_domain_line "$s" "$d" "$tree" "$_last"
+            done
+        else
+            say "$s"
+            _count=0; _idx=0
+            for d in $domains; do [ -n "$d" ] && _count=$((_count+1)); done
+            for d in $domains; do
+                [ -n "$d" ] || continue
+                _idx=$((_idx+1)); _last=0; [ "$_idx" -eq "$_count" ] && _last=1
+                if [ "$_last" -eq 1 ]; then tree='└─'; else tree='├─'; fi
+                print_domain_line "$s" "$d" "$tree" "$_last"
+            done
+        fi
+        say ''
+    done < "$STATE/services.list"
+    say '------------------------------------------------------------'
+    printf '%s\n' "$( [ "${LANG_MODE:-RU}" = RU ] && printf '%s' "Всего доменов: $total | Доступны: $ok | Недоступны: $bad | Без полного результата: $partial" || printf '%s' "Total domains: $total | Available: $ok | Unavailable: $bad | Incomplete: $partial" )"
+    say '============================================================'
+}
+
+
+baseline() {
+    say ''
+    say '============================================================'
+    say " $(t PREPARE_BASELINE)"
+    say '============================================================'
+    say "$(t SERVICES):"
+    while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        say "  - $s"
+        print_service_groups "$s"
+    done < "$STATE/services.list"
+    say '------------------------------------------------------------'
+    t DNS_TRANSPORT
+    say "$(t RUNNING)"
+    say ''
+    baseline_worker > "$RUN/baseline-worker.out" 2> "$RUN/baseline-worker.err" &
+    bp=$!
+    frames='|/-\\'
+    i=0
+    start_epoch="$(date +%s)"
+    while kill -0 "$bp" 2>/dev/null; do
+        now_epoch="$(date +%s)"
+        elapsed=$((now_epoch-start_epoch))
+        idx=$((i % 4 + 1))
+        frame="$(printf '%s' "$frames" | cut -c "$idx")"
+        progress="$(cat "$RUN/baseline-progress" 2>/dev/null || true)"
+        if [ -n "$progress" ]; then
+            pn="$(printf '%s' "$progress" | cut -d'|' -f1)"
+            pt="$(printf '%s' "$progress" | cut -d'|' -f2)"
+            pd="$(printf '%s' "$progress" | cut -d'|' -f3)"
+            ps="$(printf '%s' "$progress" | cut -d'|' -f4)"
+            [ -n "$ps" ] || ps="CHECK"
+            printf '\r  [%s] %s... %s/%s %-28s [%s] %02d:%02d' "$frame" "$(t RUNNING)" "$pn" "$pt" "$pd" "$ps" $((elapsed/60)) $((elapsed%60))
+        else
+            printf '\r  [%s] %s... %02d:%02d' "$frame" "$(t PREPARE_BASELINE)" $((elapsed/60)) $((elapsed%60))
+        fi
+        sleep 1
+        i=$((i+1))
+    done
+    wait "$bp" 2>/dev/null || true
+    printf '\r%s\r' '                                                                                '
+    err_file="$RUN/baseline-worker.err"
+    if [ -s "$err_file" ]; then
+        say "$(t RUNNING): warning"
+        sed 's/^/  /' "$err_file"
+    fi
+    print_baseline_results
+    say "$(t BASELINE_DONE)"
+    say '============================================================'
+    rm -f "$RUN/baseline-progress" "$RUN/baseline-worker.out" "$RUN/baseline-worker.err"
+}
+
+# ---------- native availability diagnostics ----------
+AVAIL_CONFIG="$ETC/availability.conf"
+
+external_preflight() {
+    say ''
+    say "$(t AVAIL_MENU)"
+    t USE_NATIVE
+    printf "%s : %s\n" "$(t OUTPUT_DIR)" "$EXTERNAL_DIR"
+    say "curl    : $(has curl && echo AVAILABLE || echo MISSING)"
+    say "jq      : $(has jq && echo AVAILABLE || echo MISSING)"
+    say "dig     : $(has dig && echo AVAILABLE || echo MISSING)"
+    say "nc      : $(has nc && echo AVAILABLE || echo MISSING)"
+    say "iperf3  : $(has iperf3 && echo AVAILABLE || echo MISSING)"
+    say "ping    : $(has ping && echo AVAILABLE || echo MISSING)"
+    say ''
+}
+
+external_mark() {
+    test_name="$1"; status="$2"; detail="${3:-}"
+    printf '%s|%s|%s|%s\n' "$(date '+%F %T')" "$test_name" "$status" "$detail" >> "$EXTERNAL_DIR/results.tsv"
+}
+
+run_external_command() {
+    name="$1"; label="$2"; shift 2
+    [ "${ENABLE_EXTERNAL_TESTS:-1}" = 1 ] || { say '[SKIP] External tests disabled.'; return 0; }
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    safe="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_')"
+    tmp="$EXTERNAL_DIR/.${safe}-${ts}.txt"
+    fifo="$RUN/external-$$.fifo"
+    rcfile="$RUN/external-$$.rc"
+    rm -f "$fifo" "$rcfile"
+    : > "$tmp"
+    mkfifo "$fifo" 2>/dev/null || { say "[$(t TAG_FAIL)] Cannot create FIFO: $fifo"; return 1; }
+    say ''
+    say '============================================================'
+    say " $label"
+    say '============================================================'
+    say "zapret-test      : $VERSION"
+    say "$(t STARTED)          : $(date)"
+    say '------------------------------------------------------------'
+    t LIVE_OUTPUT
+    tee "$tmp" < "$fifo" & tee_pid=$!
+    start_epoch="$(date +%s)"
+    if has setsid; then
+        setsid sh -c 'fifo="$1"; rcfile="$2"; shift 2; "$@" >"$fifo" 2>&1; rc=$?; printf "%s\n" "$rc" >"$rcfile"; exit "$rc"' sh "$fifo" "$rcfile" "$@" &
+        isolated=1
+    else
+        ( "$@" >"$fifo" 2>&1; rc=$?; printf '%s\n' "$rc" >"$rcfile"; exit "$rc" ) &
+        isolated=0
+    fi
+    pid=$!
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    printf '%s|%s|%s\n' "$pid" "$pgid" "$isolated" > "$RUN/active.external.pid"
+    EXTERNAL_RUNNING_PID="$pid"; EXTERNAL_RUNNING_LOG="$tmp"; EXTERNAL_RUNNING_PGID="$pgid"; EXTERNAL_RUNNING_ISOLATED="$isolated"
+    interrupted=0
+    SIGNAL_STAGE=external
+    EXTERNAL_TEE_PID="${tee_pid:-}"
+    external_signal_handler() {
+        interrupted=1
+        if [ -n "${EXTERNAL_TEE_PID:-}" ]; then
+            kill_tree "$EXTERNAL_TEE_PID" >/dev/null 2>&1 || true
+            kill -KILL "$EXTERNAL_TEE_PID" 2>/dev/null || true
+        fi
+        kill_active_record "$RUN/active.external.pid" >/dev/null 2>&1 || true
+        printf "%s\n" 130 > "$rcfile"
+    }
+    heartbeat=0
+    while [ ! -f "$rcfile" ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then printf '125\n' > "$rcfile"; break; fi
+        sleep 1; heartbeat=$((heartbeat+1))
+    done
+    wait "$pid" 2>/dev/null || true
+    wait "$tee_pid" 2>/dev/null || true
+    rc="$(cat "$rcfile" 2>/dev/null || echo 125)"
+    case "$rc" in ''|*[!0-9]*) rc=125;; esac
+    end_epoch="$(date +%s)"; elapsed=$((end_epoch-start_epoch))
+    status=COMPLETED
+    [ "$rc" -eq 130 ] && status=INTERRUPTED
+    [ "$interrupted" -eq 1 ] && status=INTERRUPTED && rc=130
+    [ "$rc" -ne 0 ] && [ "$status" = COMPLETED ] && status=EXITED_WITH_ERROR
+    SIGNAL_STAGE=""
+    rm -f "$RUN/active.external.pid" "$fifo" "$rcfile"
+    EXTERNAL_RUNNING_PID=""; EXTERNAL_RUNNING_LOG=""; EXTERNAL_RUNNING_PGID=""; EXTERNAL_RUNNING_ISOLATED=0
+    say '------------------------------------------------------------'
+    say "[ RESULT ] $([ "${LANG_MODE:-RU}" = RU ] && echo "Результат" || echo "Result"): $status | Exit: $rc | Duration: $(printf '%02d:%02d:%02d' $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60)))"
+    external_mark "$name" "$status" not_saved
+    rm -f "$tmp"
+    say '============================================================'
+    return "$rc"
+}
+
+run_native_test() {
+    name="$1"; label="$2"; shift 2
+    run_external_command "$name" "$label" "$@"
+}
+
+first_json_field() {
+    json="$1"; path="$2"
+    has jq || return 1
+    printf '%s' "$json" | jq -r "$path // empty" 2>/dev/null | head -n1
+}
+
+external_get_public_ip() {
+    v="$1"
+    if [ "$v" = 4 ]; then
+        curl -4 -fsS --connect-timeout 5 --max-time 10 https://api4.ipify.org 2>/dev/null || true
+    else
+        curl -6 -fsS --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/dev/null || true
+    fi
+}
+
+external_ip_region() {
+    external_check_dependencies 'IP / region native check' curl jq || return 0
+    run_native_test ip-region "$(t IPREGION) — native OpenWrt check" sh -c '
+        printf "PUBLIC IPv4: "; ip4=$(curl -4 -fsS --connect-timeout 5 --max-time 10 https://api4.ipify.org 2>/dev/null || true); [ -n "$ip4" ] && echo "$ip4" || echo UNAVAILABLE
+        printf "PUBLIC IPv6: "; ip6=$(curl -6 -fsS --connect-timeout 5 --max-time 10 https://api6.ipify.org 2>/dev/null || true); [ -n "$ip6" ] && echo "$ip6" || echo UNAVAILABLE
+        echo
+        echo "[ipwho]"
+        json=$(curl -fsS --connect-timeout 5 --max-time 12 https://ipwho.is/ 2>/dev/null || true)
+        if [ -n "$json" ]; then
+          printf "IP="; printf "%s" "$json" | jq -r .ip
+          printf "Country="; printf "%s" "$json" | jq -r .country
+          printf "CountryCode="; printf "%s" "$json" | jq -r .country_code
+          printf "Region="; printf "%s" "$json" | jq -r .region
+          printf "City="; printf "%s" "$json" | jq -r .city
+          printf "ASN="; printf "%s" "$json" | jq -r ".connection.asn // .connection.asn_number // .connection.number // empty"
+          printf "Organization="; printf "%s" "$json" | jq -r ".connection.org // .connection.asn_org // empty"
+          printf "VPN="; printf "%s" "$json" | jq -r ".security.isVpn // false"
+          printf "Tor="; printf "%s" "$json" | jq -r ".security.isTor // false"
+        else echo "REQUEST=FAILED"; fi
+        echo
+        echo "[ip-api]"
+        json=$(curl -fsS --connect-timeout 5 --max-time 12 "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,org,as,query,proxy,hosting" 2>/dev/null || true)
+        if [ -n "$json" ]; then
+          printf "Status="; printf "%s" "$json" | jq -r .status
+          printf "IP="; printf "%s" "$json" | jq -r .query
+          printf "Country="; printf "%s" "$json" | jq -r .country
+          printf "CountryCode="; printf "%s" "$json" | jq -r .countryCode
+          printf "Region="; printf "%s" "$json" | jq -r .regionName
+          printf "City="; printf "%s" "$json" | jq -r .city
+          printf "ASN="; printf "%s" "$json" | jq -r .as
+          printf "Organization="; printf "%s" "$json" | jq -r ".org // .isp // empty"
+          printf "Proxy="; printf "%s" "$json" | jq -r ".proxy // false"
+          printf "Hosting="; printf "%s" "$json" | jq -r ".hosting // false"
+        else echo "REQUEST=FAILED"; fi
+        echo
+        if [ "${LANG_MODE:-RU}" = RU ]; then echo "ПРИМЕЧАНИЕ: независимые базы GeoIP могут различаться; расхождения показываются явно и не считаются ошибкой."; else echo "NOTE: Independent GeoIP databases can disagree; discrepancies are shown explicitly and are not treated as errors."; fi
+    '
+}
+
+external_censor_native() {
+    mode="$1"
+    external_check_dependencies "Censorcheck-like $mode" curl dig || return 0
+    if [ "$mode" = dpi ]; then
+        domains='youtube.com discord.com instagram.com facebook.com x.com linkedin.com rutracker.org digitalocean.com amnezia.org getoutline.org mailfence.com flibusta.is rezka.ag api.telegram.org play.google.com'
+        label="$(t DPI)"
+    else
+        domains='spotify.com netflix.com patreon.com swagger.io snyk.io mongodb.com autodesk.com graylog.org redis.io copilot.microsoft.com'
+        label="$(t GEOBLOCK)"
+    fi
+    run_native_test "censor-$mode" "$label — native OpenWrt implementation" sh -c '
+        domains="$1"
+        printf "%-27s %-12s %-8s %-8s %-18s\n" DOMAIN DNS HTTP HTTPS RESULT
+        printf "%-27s %-12s %-8s %-8s %-18s\n" --------------------------- ------------ -------- -------- ------------------
+        for d in $domains; do
+            sys=$(dig +short "$d" A 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)
+            dns=FAIL; [ -n "$sys" ] && dns=OK
+            if [ -z "$sys" ]; then
+                printf "%-27s %-12s %-8s %-8s %-18s\n" "$d" "$dns" N/A N/A DNS_FAIL; continue
+            fi
+            # Synthetic DNS ranges used by some local filtering setups are explicitly flagged.
+            result=RESPONDED
+            echo "$sys" | grep -Eq "^(198\\.18\\.|198\\.19\\.)" && dns=INTERCEPTED
+            http=$(curl -4 -sS -o /dev/null --connect-timeout 5 --max-time 12 -w "%{http_code}" "http://$d" 2>/dev/null)
+            https=$(curl -4 -sS -o /dev/null --connect-timeout 5 --max-time 12 -w "%{http_code}" "https://$d" 2>/dev/null)
+            [ -n "$http" ] || http=000
+            [ -n "$https" ] || https=000
+            case "$http:$https" in
+              000:000) result=UNREACHABLE;;
+              *:000|000:*) result=PARTIAL;;
+              *) result=RESPONDED;;
+            esac
+            printf "%-27s %-12s %-8s %-8s %-18s\n" "$d" "$dns" "$http" "$https" "$result"
+        done
+        echo
+        echo "NOTE: HTTP/HTTPS status is an endpoint response, not proof of full application functionality. 3xx and 403 are not automatically blocks."
+    ' sh "$domains"
+}
+
+external_ru_iperf_native() {
+    external_check_dependencies 'Russian iPerf3 native check' curl iperf3 jq awk sed || return 0
+    run_native_test russian-iperf3 "$(t IPERF) — native OpenWrt check" sh -c '
+        set -u
+
+        # Public Russian iPerf server pairs. Kept locally so this check does not
+        # depend on downloading or parsing a remote Bash benchmark script.
+        TESTS="Moscow|spd-rudp.hostkey.ru|Tver|st.tver.ertelecom.ru
+Saint Petersburg|st.spb.ertelecom.ru|Yaroslavl|st.yar.ertelecom.ru
+Nizhny Novgorod|st.nn.ertelecom.ru|Nizhny Novgorod|speed-nn.vtt.net
+Chelyabinsk|st.chel.ertelecom.ru|Magnitogorsk|st.mgn.ertelecom.ru
+Tyumen|st.tmn.ertelecom.ru|Krasnoyarsk|st.krsk.ertelecom.ru"
+
+        DISCOVERY_TIMEOUT=15
+        TEST_DURATION=5
+        STREAMS=8
+
+        # Public examples for these servers explicitly use IPv4. Force -4 so an
+        # unrelated IPv6/AAAA route cannot make a healthy IPv4 server look dead.
+        find_port() {
+            host="$1"
+            [ -n "$host" ] || return 1
+            for p in 5201 5202 5203 5204 5205 5206 5207 5208 5209; do
+                out="$(internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$p" -t 1 -J 2>/dev/null || true)"
+                bps="$(printf "%s" "$out" | jq -r ".end.sum_received.bits_per_second // 0" 2>/dev/null || printf "0")"
+                case "$bps" in
+                    ""|0|0.0|0.00) ;;
+                    *[!0-9.]*) ;;
+                    *) printf "%s" "$p"; return 0 ;;
+                esac
+            done
+            return 1
+        }
+
+        measure_direction() {
+            host="$1"; port="$2"; reverse="$3"
+            if [ "$reverse" = 1 ]; then
+                internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$port" -P "$STREAMS" -t "$TEST_DURATION" -R -J 2>/dev/null || true
+            else
+                internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$port" -P "$STREAMS" -t "$TEST_DURATION" -J 2>/dev/null || true
+            fi
+        }
+
+        extract_bps() {
+            json="$1"; field="$2"
+            printf "%s" "$json" | jq -r "$field // 0" 2>/dev/null
+        }
+
+        valid_json() {
+            json="$1"
+            printf "%s" "$json" | jq -e "((.end.sum_sent.bits_per_second // 0) > 0) and ((.end.sum_received.bits_per_second // 0) > 0) and ((.error? // \"\") == \"\")" >/dev/null 2>&1
+        }
+
+        ping_avg() {
+            host="$1"
+            if command -v ping >/dev/null 2>&1; then
+                v="$(ping -4 -c 3 -W 2 "$host" 2>/dev/null | sed -n "s/.*= *[0-9.]*\/\([0-9.]*\)\/[0-9.]*.*$/\1/p" | head -n1)"
+                [ -n "$v" ] && { printf "%s" "$v"; return; }
+            fi
+            printf "%s" "N/A"
+        }
+
+        printf "%-18s %-30s %-6s %-8s %-11s %-11s %-12s\n" CITY SERVER PORT PING DOWNLOAD UPLOAD STATUS
+        printf "%-18s %-30s %-6s %-8s %-11s %-11s %-12s\n" ------------------ ------------------------------ ------ -------- ----------- ----------- ------------
+
+        total=0
+        ok_count=0
+        old_ifs="$IFS"
+        IFS="$(printf "\nX")"; IFS="${IFS%X}"
+
+        for row in $TESTS; do
+            IFS="|" read -r city primary fallback_city fallback_host <<EOF2
+$row
+EOF2
+            IFS="$(printf "\nX")"; IFS="${IFS%X}"
+            total=$((total+1))
+
+            host=""
+            display_city="$city"
+            port=""
+            primary_ping="$(ping_avg "$primary")"
+            fallback_ping="N/A"
+
+            if p="$(find_port "$primary")"; then
+                host="$primary"
+                port="$p"
+            else
+                fallback_ping="$(ping_avg "$fallback_host")"
+                if p="$(find_port "$fallback_host")"; then
+                    host="$fallback_host"
+                    display_city="$fallback_city (fallback)"
+                    port="$p"
+                fi
+            fi
+
+            if [ -z "$port" ]; then
+                printf "%-18s %-30s %-6s %-8s %-11s %-11s %-12s\n" "$city" "$primary" - "$primary_ping" - - TCP_DOWN
+                continue
+            fi
+
+            upload_json="$(measure_direction "$host" "$port" 0)"
+            download_json="$(measure_direction "$host" "$port" 1)"
+            upload_ok=0
+            download_ok=0
+            valid_json "$upload_json" && upload_ok=1
+            valid_json "$download_json" && download_ok=1
+
+            if [ "$upload_ok" -eq 1 ]; then
+                up_field=".end.sum_sent.bits_per_second"
+                up_bps="$(extract_bps "$upload_json" "$up_field")"
+                up="$(awk -v x="${up_bps:-0}" "BEGIN {printf \"%.1f\", x/1000000}")"
+            else
+                up="-"
+            fi
+
+            if [ "$download_ok" -eq 1 ]; then
+                down_field=".end.sum_received.bits_per_second"
+                down_bps="$(extract_bps "$download_json" "$down_field")"
+                down="$(awk -v x="${down_bps:-0}" "BEGIN {printf \"%.1f\", x/1000000}")"
+            else
+                down="-"
+            fi
+
+            pingv="$(ping_avg "$host")"
+            if [ "$upload_ok" -eq 1 ] && [ "$download_ok" -eq 1 ]; then
+                status=OK
+                ok_count=$((ok_count+1))
+            elif [ "$upload_ok" -eq 1 ] || [ "$download_ok" -eq 1 ]; then
+                status=PARTIAL
+                ok_count=$((ok_count+1))
+            else
+                status=MEASURE_FAIL
+            fi
+            printf "%-18s %-30s %-6s %-8s %-11s %-11s %-12s\n" "$display_city" "$host" "$port" "$pingv" "$down" "$up" "$status"
+            sleep 1
+        done
+        IFS="$old_ifs"
+
+        echo
+        echo "Рабочих серверов: $ok_count/$total"
+        echo "Режим проверки: сначала ICMP Ping, затем iPerf3 по TCP 5201–5209; измерение 5 с upload + 5 с download, $STREAMS потоков."
+        echo "Серверы: primary + fallback. Ping не зависит от открытия TCP-порта iPerf3."
+        if [ "$ok_count" -eq 0 ]; then
+            echo "RESULT: NO_WORKING_IPERF3_SERVERS"
+            exit 1
+        fi
+        echo "RESULT: AT_LEAST_ONE_SERVER_OK"
+    '
+}
+
+external_iperf_alternative() {
+    external_check_dependencies 'Alternative iPerf3' iperf3 jq awk sed || return 0
+    run_native_test alternative-iperf3 "$(t IPERF_ALT)" sh -c '
+        set -u
+        TESTS="Amsterdam|spd-nlsrv.hostkey.com|5201
+Helsinki|spd-fisrv.hostkey.com|5201
+Frankfurt|spd-desrv.hostkey.com|5201
+Paris|iperf.online.net|5200
+Frankfurt-Projects|speedtest.ip-projects.de|5201
+Frankfurt-FortiSASE|96.45.39.38|30000
+Frankfurt-ESEVEN|178.215.228.109|9205"
+        DISCOVERY_TIMEOUT=12
+        TEST_DURATION=3
+        STREAMS=4
+
+        ping_avg() {
+            host="$1"
+            v="$(ping -4 -c 3 -W 2 "$host" 2>/dev/null | sed -n "s/.*= *[0-9.]*\/\([0-9.]*\)\/[0-9.]*.*$/\1/p" | head -n1)"
+            [ -n "$v" ] && printf "%s" "$v" || printf "%s" "N/A"
+        }
+
+        valid_json() {
+            json="$1"
+            printf "%s" "$json" | jq -e "((.end.sum_sent.bits_per_second // 0) > 0) and ((.end.sum_received.bits_per_second // 0) > 0) and ((.error? // \"\") == \"\")" >/dev/null 2>&1
+        }
+
+        speed() {
+            json="$1"; field="$2"
+            bps="$(printf "%s" "$json" | jq -r "$field // 0" 2>/dev/null)"
+            case "$bps" in
+                ""|*[!0-9.]* ) printf "%s" "-" ;;
+                * ) awk -v x="$bps" "BEGIN {printf \"%.1f\", x/1000000}" ;;
+            esac
+        }
+
+        printf "%-24s %-30s %-7s %-8s %-11s %-11s %-12s\n" CITY SERVER PORT PING DOWNLOAD UPLOAD STATUS
+        printf "%-24s %-30s %-7s %-8s %-11s %-11s %-12s\n" ------------------------ ------------------------------ ------- -------- ----------- ----------- ------------
+        total=0; ok_count=0
+        old_ifs="$IFS"; IFS="$(printf "\nX")"; IFS="${IFS%X}"
+        for row in $TESTS; do
+            IFS="|" read -r city host port <<EOF2
+$row
+EOF2
+            IFS="$(printf "\nX")"; IFS="${IFS%X}"
+            total=$((total+1))
+            pingv="$(ping_avg "$host")"
+            probe="$(internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$port" -P 1 -t 1 -J 2>/dev/null || true)"
+            if ! valid_json "$probe"; then
+                printf "%-24s %-30s %-7s %-8s %-11s %-11s %-12s\n" "$city" "$host" "$port" "$pingv" - - DOWN
+                continue
+            fi
+            upload_json="$(internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$port" -P "$STREAMS" -t "$TEST_DURATION" -J 2>/dev/null || true)"
+            download_json="$(internal_timeout "$DISCOVERY_TIMEOUT" iperf3 -4 -c "$host" -p "$port" -P "$STREAMS" -t "$TEST_DURATION" -R -J 2>/dev/null || true)"
+            up="-"; down="-"; uok=0; dok=0
+            upload_field=".end.sum_sent.bits_per_second"
+            download_field=".end.sum_received.bits_per_second"
+            valid_json "$upload_json" && { up="$(speed "$upload_json" "$upload_field")"; uok=1; }
+            valid_json "$download_json" && { down="$(speed "$download_json" "$download_field")"; dok=1; }
+            if [ "$uok" -eq 1 ] && [ "$dok" -eq 1 ]; then status=OK; ok_count=$((ok_count+1));
+            elif [ "$uok" -eq 1 ] || [ "$dok" -eq 1 ]; then status=PARTIAL; ok_count=$((ok_count+1));
+            else status=MEASURE_FAIL; fi
+            printf "%-24s %-30s %-7s %-8s %-11s %-11s %-12s\n" "$city" "$host" "$port" "$pingv" "$down" "$up" "$status"
+            sleep 1
+        done
+        IFS="$old_ifs"
+        echo
+        printf "Рабочих серверов: %s/%s\n" "$ok_count" "$total"
+        echo "Назначение: отличить недоступность российских iPerf3-серверов от блокировки TCP-порта 5201 и проверить другие диапазоны портов (5200/5201/30000/9205)."
+        if [ "$ok_count" -eq 0 ]; then echo "RESULT: NO_WORKING_ALTERNATIVE_IPERF3"; exit 1; fi
+        echo "RESULT: ALTERNATIVE_IPERF3_OK"
+    '
+}
+
+external_ping_reachability() {
+    external_check_dependencies 'Ping reachability' ping || return 0
+    run_native_test ping-reachability "$(t PING)" sh -c '
+        set -u
+        gateway="$(ip -4 route show default 2>/dev/null | awk "{print \$3; exit}")"
+        [ -n "$gateway" ] || gateway="N/A"
+        TARGETS="Default gateway|$gateway
+Cloudflare DNS|1.1.1.1
+Google DNS|8.8.8.8
+OpenDNS|208.67.222.222
+Yandex DNS|77.88.8.8
+Quad9 DNS|9.9.9.9
+Hostkey Frankfurt|spd-desrv.hostkey.com
+Hostkey Amsterdam|spd-nlsrv.hostkey.com
+Hostkey Helsinki|spd-fisrv.hostkey.com
+Hostkey Paris|spd-frsrv.hostkey.com"
+        printf "%-22s %-28s %-8s %-8s %-8s\n" TARGET ADDRESS AVG_MS LOSS STATUS
+        printf "%-22s %-28s %-8s %-8s %-8s\n" ---------------------- ---------------------------- -------- -------- --------
+        total=0; reachable=0
+        old_ifs="$IFS"; IFS="$(printf "\nX")"; IFS="${IFS%X}"
+        for row in $TARGETS; do
+            IFS="|" read -r name addr <<EOF2
+$row
+EOF2
+            IFS="$(printf "\nX")"; IFS="${IFS%X}"
+            total=$((total+1))
+            if [ "$addr" = N/A ]; then
+                avg="-"; loss="-"; status=NO_GATEWAY
+            else
+                out="$(ping -4 -c 3 -W 2 "$addr" 2>&1 || true)"
+                avg="$(printf "%s" "$out" | sed -n "s/.*= *[0-9.]*\/\([0-9.]*\)\/[0-9.]*.*$/\1/p" | head -n1)"
+                loss="$(printf "%s" "$out" | sed -n "s/.*\([0-9][0-9]*\)% packet loss.*/\1/p" | head -n1)"
+                [ -n "$avg" ] || avg="-"
+                [ -n "$loss" ] || loss="100"
+                if [ "$loss" -lt 100 ]; then status=REACHABLE; reachable=$((reachable+1)); else status=NO_REPLY; fi
+            fi
+            [ "$addr" = N/A ] && printf "%-22s %-28s %-8s %-8s %-8s\n" "$name" "$addr" "$avg" "$loss" "$status" || printf "%-22s %-28s %-8s %-8s %-8s\n" "$name" "$addr" "$avg" "${loss}%" "$status"
+        done
+        IFS="$old_ifs"
+        echo
+        printf "Доступно: %s/%s\n" "$reachable" "$total"
+        echo "Примечание: отсутствие ICMP-ответа не доказывает блокировку сервиса; многие серверы игнорируют ping."
+        if [ "$reachable" -eq 0 ]; then echo "RESULT: NO_PING_REPLIES"; exit 1; fi
+        echo "RESULT: PING_REACHABILITY_OK"
+    '
+}
+
+external_ip_quality_native() {
+    external_check_dependencies 'IP quality native check' curl jq || return 0
+    run_native_test ip-quality "$(t IPQUALITY) — native OpenWrt cross-check" sh -c '
+        echo "[ipwho]"
+        json=$(curl -fsS --connect-timeout 5 --max-time 12 https://ipwho.is/ 2>/dev/null || true)
+        if [ -n "$json" ]; then
+          printf "IP="; printf "%s" "$json" | jq -r .ip
+          printf "Country="; printf "%s" "$json" | jq -r .country
+          printf "CountryCode="; printf "%s" "$json" | jq -r .country_code
+          printf "Region="; printf "%s" "$json" | jq -r .region
+          printf "City="; printf "%s" "$json" | jq -r .city
+          printf "ASN="; printf "%s" "$json" | jq -r ".connection.asn // .connection.asn_number // .connection.number // empty"
+          printf "Organization="; printf "%s" "$json" | jq -r ".connection.org // .connection.asn_org // empty"
+          printf "VPN="; printf "%s" "$json" | jq -r ".security.isVpn // false"
+          printf "Tor="; printf "%s" "$json" | jq -r ".security.isTor // false"
+          printf "Threat="; printf "%s" "$json" | jq -r ".security.isThreat // empty"
+        else echo "REQUEST=FAILED"; fi
+        echo
+        echo "[ip-api]"
+        json=$(curl -fsS --connect-timeout 5 --max-time 12 "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,org,as,query,proxy,hosting" 2>/dev/null || true)
+        if [ -n "$json" ]; then
+          printf "Status="; printf "%s" "$json" | jq -r .status
+          printf "IP="; printf "%s" "$json" | jq -r .query
+          printf "Country="; printf "%s" "$json" | jq -r .country
+          printf "CountryCode="; printf "%s" "$json" | jq -r .countryCode
+          printf "Region="; printf "%s" "$json" | jq -r .regionName
+          printf "City="; printf "%s" "$json" | jq -r .city
+          printf "ASN="; printf "%s" "$json" | jq -r .as
+          printf "Organization="; printf "%s" "$json" | jq -r ".org // .isp // empty"
+          printf "Proxy="; printf "%s" "$json" | jq -r ".proxy // false"
+          printf "Hosting="; printf "%s" "$json" | jq -r ".hosting // false"
+        else echo "REQUEST=FAILED"; fi
+        echo
+        echo "Interpretation: these are provider observations. A provider flag is not treated as a definitive block/VPN verdict."
+    '
+}
+
+external_native_curl_smoke() {
+    external_check_dependencies 'HTTP/HTTPS connectivity' curl dig jq || return 0
+    run_native_test http-smoke 'HTTP/HTTPS + DNS integrity' sh -c '
+        urls="https://example.com https://openwrt.org https://github.com https://discord.com https://youtube.com https://rutracker.org"
+        for u in $urls; do
+            host="$(printf "%s" "$u" | sed "s#^[a-zA-Z]*://##; s#/.*##")"
+            echo
+            echo "=== $u ==="
+            sys=$(dig +short "$host" A 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)
+            doh=$(curl -fsS --connect-timeout 5 --max-time 10 -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=$host&type=A" 2>/dev/null | jq -r ".Answer[]?.data" 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)
+            printf "DNS(system)=%s DNS(DoH)=%s" "${sys:-FAIL}" "${doh:-FAIL}"
+            if [ -n "$sys" ] && [ -n "$doh" ] && [ "$sys" != "$doh" ]; then printf " [MISMATCH]"; fi
+            echo
+            curl -4 -sS -o /dev/null --connect-timeout 10 --max-time 15 -w "HTTP=%{http_code} IP=%{remote_ip} DNS_TIME=%{time_namelookup}s CONNECT=%{time_connect}s TLS=%{time_appconnect}s TTFB=%{time_starttransfer}s TOTAL=%{time_total}s\n" "$u" 2>&1 || true
+        done
+        echo
+        echo "198.18.0.0/15 is explicitly treated as synthetic/test address space; if a target resolves there, DNS interception is reported instead of treating it as a genuine remote IP."
+    '
+}
+
+external_check_dependencies() {
+    label="$1"; shift
+    missing=""
+    for dep in "$@"; do has "$dep" || missing="$missing $dep"; done
+    [ -z "$missing" ] && return 0
+    say "[UNAVAILABLE] $label: missing dependencies:$missing"
+    external_mark "$(printf '%s' "$label" | tr ' ' '_' | tr -cd 'A-Za-z0-9_-')" UNAVAILABLE "missing:$missing"
+    return 1
+}
+
+external_dns_transport_integrity() {
+    external_check_dependencies 'DNS transport / synthetic-IP integrity' curl dig jq openssl || return 0
+    run_native_test dns-transport 'DNS transport / configured router resolvers / 127.0.0.42' sh -c '
+        DNS_DOMAINS="${DNS_TEST_DOMAINS:-youtube.com discord.com rutracker.org openwrt.org github.com}"
+        EXPECTED_SYNTH="${DNS_SYNTH_IP:-127.0.0.42}"
+        RESOLV_FILE="${DNS_CONFIG_FILE:-/tmp/resolv.conf.d/resolv.conf.auto}"
+        [ -s "$RESOLV_FILE" ] || RESOLV_FILE="/etc/resolv.conf"
+        LOCAL_DNS="$(awk "/^nameserver /{print \$2}" /etc/resolv.conf 2>/dev/null | head -n5 | tr "\n" " ")"
+        CONFIG_DNS="$(awk "/^nameserver /{print \$2}" "$RESOLV_FILE" 2>/dev/null | head -n5 | tr "\n" " ")"
+        [ -n "$CONFIG_DNS" ] || CONFIG_DNS="$LOCAL_DNS"
+        echo "Router resolver config: $RESOLV_FILE"
+        echo "Local resolver(s): ${LOCAL_DNS:-UNAVAILABLE}"
+        echo "Configured upstream resolver(s): ${CONFIG_DNS:-UNAVAILABLE}"
+        echo "127.0.0.42 / 198.18.0.0/15 are treated as synthetic DNS interception markers."
+        echo
+        dot=UNAVAILABLE
+        if printf "" | openssl s_client -connect 1.1.1.1:853 -servername cloudflare-dns.com -brief >/tmp/dot.$$ 2>&1; then dot=TLS_OK; elif grep -q "CONNECTION ESTABLISHED" /tmp/dot.$$ 2>/dev/null; then dot=TLS_OK; else dot=TLS_FAIL; fi
+        rm -f /tmp/dot.$$
+        printf "%-24s %-18s %-18s %-18s %-12s %-12s\n" DOMAIN LOCAL_UDP CONFIGURED_UDP DOH SYNTH DOT_TLS
+        printf "%-24s %-18s %-18s %-18s %-12s %-12s\n" ------------------------ ------------------ ------------------ ------------------ ------------ ------------
+        for d in $DNS_DOMAINS; do
+            local="$(dig @127.0.0.1 +time=2 +tries=1 +short "$d" A 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)"
+            upstream=""
+            for r in $CONFIG_DNS; do
+                case "$r" in 127.0.0.1|::1) continue;; esac
+                upstream="$(dig @"$r" +time=2 +tries=1 +short "$d" A 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)"
+                [ -n "$upstream" ] && break
+            done
+            doh="$(curl -4 -fsS --connect-timeout 5 --max-time 8 -H "accept: application/dns-json" "https://cloudflare-dns.com/dns-query?name=$d&type=A" 2>/dev/null | jq -r ".Answer[]?.data" 2>/dev/null | grep -E "^[0-9.]+$" | head -n1 || true)"
+            synth=NO; case "$local" in "$EXPECTED_SYNTH"|198.18.*|198.19.*) synth=YES;; esac
+            printf "%-24s %-18s %-18s %-18s %-12s %-12s\n" "$d" "${local:-FAIL}" "${upstream:-FAIL}" "${doh:-FAIL}" "$synth" "$dot"
+        done
+        echo
+        echo "DoT result is TLS transport reachability only; no full DNS-over-TLS query is claimed without a DoT client."
+    '
+}
+
+external_nvidia_detailed() {
+    external_check_dependencies 'NVIDIA detailed diagnostics' curl dig openssl nc || return 0
+    rec="$(service_record NVIDIA)"
+    IFS='|' read -r _ _ _ _ _ _ _ _ groups <<EOF2
+$rec
+EOF2
+    [ -n "${groups:-}" ] || { say '[ERROR] NVIDIA groups are not configured.'; return 1; }
+    run_native_test nvidia-detailed "$(t NVIDIA_DETAIL)" sh -c '
+        groups="$1"
+        resolve_a() { dig +short "$1" A 2>/dev/null | grep -E "^[0-9.]+$" | head -n1; }
+        check_metrics() {
+            d="$1"
+            ip=$(resolve_a "$d")
+            [ -n "$ip" ] || { printf "|0|0|0|000"; return; }
+            tcp=0; nc -z -w 3 "$ip" 443 >/dev/null 2>&1 && tcp=1
+            tls=0; tlsout=$(printf "" | openssl s_client -connect "$d:443" -servername "$d" -brief 2>&1 || true); echo "$tlsout" | grep -Eq "Protocol[^:]*:[[:space:]]*TLS|Protocol.*TLSv1" && tls=1
+            code=$(curl -4 -sS -o /dev/null --connect-timeout 5 --max-time 10 -w "%{http_code}" "https://$d" 2>/dev/null || true); [ -n "$code" ] || code=000
+            http=0; case "$code" in 2*|3*|4*|5*) http=1;; esac
+            printf "%s|%s|%s|%s|%s" "$ip" "$tcp" "$tls" "$http" "$code"
+        }
+        title() { case "$1" in "Telemetry / Analytics") echo "Telemetry";; "CDN / Content") echo "CDN";; *) echo "$1";; esac; }
+        aggregate() {
+            name="$1"; doms="$2"; total=0; dns=0; tcp=0; tls=0; http=0; first_ip=""; first_code=""
+            old="$IFS"; IFS=" "; set -- $doms
+            for d in "$@"; do
+                [ -n "$d" ] || continue; total=$((total+1)); m=$(check_metrics "$d"); ip=$(printf "%s" "$m" | cut -d"|" -f1); t=$(printf "%s" "$m" | cut -d"|" -f2); l=$(printf "%s" "$m" | cut -d"|" -f3); h=$(printf "%s" "$m" | cut -d"|" -f4); c=$(printf "%s" "$m" | cut -d"|" -f5); [ -n "$ip" ] && dns=$((dns+1)); [ "$t" = 1 ] && tcp=$((tcp+1)); [ "$l" = 1 ] && tls=$((tls+1)); [ "$h" = 1 ] && http=$((http+1)); [ -n "$first_ip" ] || first_ip="$ip"; [ -n "$first_code" ] || first_code="$c"
+            done
+            IFS="$old"; [ "$dns" = "$total" ] && dm="✓" || dm="✗"; [ "$tcp" = "$total" ] && tm="✓" || tm="✗"; [ "$tls" = "$total" ] && lm="✓" || lm="✗"; [ "$http" = "$total" ] && hm="✓" || hm="✗"
+            echo "$(title "$name")"; if [ "$dm" = "✓" ] && [ -n "$first_ip" ]; then echo "├─ DNS       ✓  $first_ip"; else echo "├─ DNS       ✗"; fi; echo "├─ TCP 443   $tm"; echo "├─ TLS       $lm"; if [ "$hm" = "✓" ]; then echo "└─ HTTPS     ✓  HTTP $first_code"; else echo "└─ HTTPS     ✗"; fi
+        }
+        listed() {
+            name="$1"; doms="$2"; echo "$(title "$name")"; old="$IFS"; IFS=" "; set -- $doms; total="$#"; idx=0
+            for d in "$@"; do [ -n "$d" ] || continue; idx=$((idx+1)); m=$(check_metrics "$d"); ip=$(printf "%s" "$m" | cut -d"|" -f1); h=$(printf "%s" "$m" | cut -d"|" -f4); [ "$h" = 1 ] && mark="✓" || mark="✗ BLOCKED"; [ "$idx" = "$total" ] && br="└─" || br="├─"; printf "%s %-27s %s\n" "$br" "$d" "$mark"; done; IFS="$old"
+        }
+        old="$IFS"; IFS=";"; first=1
+        for grp in $groups; do
+            [ -n "$grp" ] || continue; name="${grp%%::*}"; doms="${grp#*::}"; [ "$first" = 1 ] || echo
+            case "$name" in "NVIDIA App"|"Drivers"|"Authentication") aggregate "$name" "$doms";; *) listed "$name" "$doms";; esac; first=0
+        done
+        IFS="$old"
+    ' sh "$groups"
+}
+
+external_menu() {
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; external_preflight
+    while :; do
+        say ''
+        say '=============================================='
+        say " $(t AVAIL_MENU)"
+        say '=============================================='
+        say "[1] $(t FULL_AVAIL)"
+        say "[2] $(t IPREGION)"
+        say "[3] $(t DPI)"
+        say "[4] $(t GEOBLOCK)"
+        say "[5] $(t IPERF)"
+        say "[6] $(t IPERF_ALT)"
+        say "[7] $(t PING)"
+        say "[8] $(t IPQUALITY)"
+        say "[9] $(t HTTPDNS)"
+        say "[10] $(t NVIDIA_DETAIL)"
+        say "[11] DNS transport / configured router resolvers / 127.0.0.42"
+        say "[12] $(t RESULTS)"
+        say "[0] $(t BACK)"
+        t SELECT; read e || return 0
+        case "$e" in
+            1) external_ip_region; external_censor_native dpi; external_censor_native geoblock; external_ru_iperf_native; external_iperf_alternative; external_ping_reachability; external_ip_quality_native; external_native_curl_smoke; ui_pause;;
+            2) external_ip_region; ui_pause;;
+            3) external_censor_native dpi; ui_pause;;
+            4) external_censor_native geoblock; ui_pause;;
+            5) external_ru_iperf_native; ui_pause;;
+            6) external_iperf_alternative; ui_pause;;
+            7) external_ping_reachability; ui_pause;;
+            8) external_ip_quality_native; ui_pause;;
+            9) external_native_curl_smoke; ui_pause;;
+            10) external_nvidia_detailed; ui_pause;;
+            11) external_dns_transport_integrity; ui_pause;;
+            12) if [ -s "$EXTERNAL_DIR/results.tsv" ]; then { printf "DATE\tTEST\tSTATUS\tDETAIL\n"; sed "s/|/\t/g" "$EXTERNAL_DIR/results.tsv" | tail -n 20; } | sed "s/^/  /"; else say "$(t NO_SAVED_LOGS)"; fi; ui_pause;;
+            0|q|Q) return 0;;
+            *) t INVALID_SELECTION;;
+        esac
+    done
+}
+
+cmd_external() { external_menu; }
+
+# ---------- candidate handling ----------
+extract_candidates() {
+    src="$1"; engine="$2"; out="$BLOCKDIR/${engine}.candidates"
+    : > "$out"
+    # Preserve all command-like strategy lines. The parser deliberately refuses to invent options.
+    # Known zapret/zapret2 option prefixes are extracted only from upstream raw output.
+    grep -E -- '(^|[[:space:]])(--(filter-|payload=|lua-desync=|dpi-desync-|hostlist=|ipset=|fwmark=|qnum=|user=)|--lua-init=)' "$src" 2>/dev/null \
+      | sed 's/^.*\(nfqws[^ ]*\|nfqws2[^ ]*\|--filter-.*\|--payload=.*\|--lua-desync=.*\|--dpi-desync-.*\)/\1/' \
+      | sed 's/[" ]*$//' \
+      | awk '!seen[$0]++' | head -n "${FULL_MAX_CANDIDATES:-0}" > "$out" 2>/dev/null || true
+    # If no head limit is desired, recover full de-duplicated set.
+    if [ "${FULL_MAX_CANDIDATES:-0}" = 0 ]; then
+      grep -E -- '(^|[[:space:]])(--(filter-|payload=|lua-desync=|dpi-desync-|hostlist=|ipset=))' "$src" 2>/dev/null | sed 's/^[[:space:]]*//' | awk '!seen[$0]++' > "$out" || true
+    fi
+    echo "$out"
+}
+
+stop_manual_dpi_bypass_processes() {
+    stopped=0
+    self="$$"
+    for pid in $(ps 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}' | sort -u); do
+        [ "$pid" = "$self" ] && continue
+        [ -r "/proc/$pid/cmdline" ] || continue
+        cmd="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        case "$cmd" in
+            *nfqws2*|*"/nfqws "*|*" nfqws "*)
+                case "$cmd" in *zapret-test*) continue;; esac
+                kill -TERM "$pid" 2>/dev/null || true
+                stopped=$((stopped+1))
+                ;;
+        esac
+    done
+    if [ "$stopped" -gt 0 ]; then
+        sleep 1
+        for pid in $(ps 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1}' | sort -u); do
+            [ "$pid" = "$self" ] && continue
+            [ -r "/proc/$pid/cmdline" ] || continue
+            cmd="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            case "$cmd" in
+                *nfqws2*|*"/nfqws "*|*" nfqws "*)
+                    case "$cmd" in *zapret-test*) continue;; esac
+                    kill -KILL "$pid" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+    DPI_STOPPED_COUNT="$stopped"
+    return 0
+}
+
+
+run_blockcheck() {
+    engine="$1"; domains="$2"; mode="$3"
+    [ -n "$domains" ] || return 1
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    case "$engine" in
+      ZAPRET) out="$BLOCKDIR/blockcheck-${ts}.txt"; latest="$BLOCKDIR/blockcheck-latest.txt"; script="$BLOCKCHECK"; base="$ZAPRET_BASE"; name="blockcheck.sh"; label="zapret";;
+      ZAPRET2) out="$BLOCKDIR/blockcheck2-${ts}.txt"; latest="$BLOCKDIR/blockcheck2-latest.txt"; script="$BLOCKCHECK2"; base="$ZAPRET2_BASE"; name="blockcheck2.sh"; label="zapret2";;
+      *) return 1;;
+    esac
+    : > "$out"
+    # Upstream blockcheck2 requires all existing DPI-bypass processes to be stopped.
+    # Stop both init-managed and manually started nfqws/nfqws2 instances here.
+    stop_manual_dpi_bypass_processes
+    fifo="$RUN/blockcheck-$$.fifo"
+    sum_fifo="$RUN/blockcheck-summary-$$.fifo"
+    status_file="$RUN/blockcheck-$$.status"
+    rm -f "$fifo" "$sum_fifo" "$status_file"
+    mkfifo "$fifo" 2>/dev/null || return 1
+    if [ "$BLOCKCHECK_OUTPUT_MODE" != raw ]; then
+        mkfifo "$sum_fifo" 2>/dev/null || { rm -f "$fifo"; return 1; }
+    fi
+
+    BLOCKCHECK_RUNNING_ENGINE="$engine"
+    BLOCKCHECK_RUNNING_LOG="$out"
+    SIGNAL_STAGE=blockcheck
+    BLOCKCHECK_READER_PID=""
+    BLOCKCHECK_SUMMARY_PID=""
+    BLOCKCHECK_UPSTREAM_PID=""
+    : > "$RUN/active.blockcheck.pid"
+
+    blockcheck_signal_handler() {
+        interrupted=1
+        # Stop both output-reader processes. The old implementation tracked only
+        # the last process in a background pipeline, leaving tee orphaned.
+        if [ -n "${BLOCKCHECK_SUMMARY_PID:-}" ]; then
+            kill_tree "$BLOCKCHECK_SUMMARY_PID" >/dev/null 2>&1 || true
+            kill -KILL "$BLOCKCHECK_SUMMARY_PID" 2>/dev/null || true
+        fi
+        if [ -n "${BLOCKCHECK_READER_PID:-}" ]; then
+            kill_tree "$BLOCKCHECK_READER_PID" >/dev/null 2>&1 || true
+            kill -KILL "$BLOCKCHECK_READER_PID" 2>/dev/null || true
+        fi
+        # The upstream wrapper runs in its own process group. Send TERM to the
+        # whole group so blockcheck2 can execute its own cleanup handler.
+        kill_active_record "$RUN/active.blockcheck.pid" >/dev/null 2>&1 || true
+        printf '%s\n' 130 > "$status_file"
+    }
+
+    say ''
+    say '============================================================'
+    say " $name — LIVE TEST"
+    say '============================================================'
+    say "zapret-test   : $VERSION"
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Движок        : $label"; else say "Engine        : $label"; fi
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Скрипт        : $script"; else say "Script        : $script"; fi
+    display_mode="$mode"
+    [ "$mode" = force ] && display_mode=full
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Уровень сканирования : $display_mode"; else say "Scan level    : $display_mode"; fi
+    if [ "${BLOCKCHECK_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "Ограничение   : ${BLOCKCHECK_TIMEOUT}s"; else say "Time limit    : ${BLOCKCHECK_TIMEOUT}s"; fi
+    else
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "Ограничение   : без ограничения"; else say "Time limit    : unlimited"; fi
+    fi
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Домен         : $domains"; else say "Domain        : $domains"; fi
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Режим вывода   : $BLOCKCHECK_OUTPUT_MODE"; else say "Output mode   : $BLOCKCHECK_OUTPUT_MODE"; fi
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "Raw-отчёт     : $out"; else say "Raw capture   : $out"; fi
+    say '------------------------------------------------------------'
+    say "[$(t TAG_PROCESS)] $(t PROCESS_HINT1)"
+    say "[$(t TAG_PROCESS)] $(t PROCESS_HINT2)"
+    say '------------------------------------------------------------'
+
+    # Keep tee and summary as independent children, not one anonymous pipeline.
+    if [ "$BLOCKCHECK_OUTPUT_MODE" = raw ]; then
+        tee "$out" < "$fifo" &
+        BLOCKCHECK_READER_PID=$!
+    else
+        blockcheck_summary "$label" < "$sum_fifo" &
+        BLOCKCHECK_SUMMARY_PID=$!
+        tee "$out" < "$fifo" > "$sum_fifo" &
+        BLOCKCHECK_READER_PID=$!
+    fi
+
+    start_epoch="$(date +%s)"
+    if has setsid; then
+        setsid sh -c '
+            rc=1
+            if [ -x "$1" ]; then
+                cd "$2" 2>/dev/null || exit 125
+                if [ "${BLOCKCHECK_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
+                    timeout "$BLOCKCHECK_TIMEOUT" env BATCH=1 DOMAINS="$3" DOMAINS_DEFAULT="$3" TEST=standard SCANLEVEL="$4" CURL_MAX_TIME="$BLOCKCHECK_CURL_MAX_TIME" CURL_MAX_TIME_QUIC="$BLOCKCHECK_CURL_MAX_TIME_QUIC" "$1"
+                    rc=$?
+                else
+                    BATCH=1 DOMAINS="$3" DOMAINS_DEFAULT="$3" TEST=standard SCANLEVEL="$4" CURL_MAX_TIME="$BLOCKCHECK_CURL_MAX_TIME" CURL_MAX_TIME_QUIC="$BLOCKCHECK_CURL_MAX_TIME_QUIC" "$1"
+                    rc=$?
+                fi
+            else
+                printf "[ERROR] %s is not executable: %s\n" "$5" "${1:-NOT FOUND}"
+                rc=127
+            fi
+            printf "%s\n" "$rc" > "$6"
+            exit "$rc"
+        ' sh "$script" "$base" "$domains" "$mode" "$name" "$status_file" > "$fifo" 2>&1 &
+        isolated=1
+    else
+        (
+            rc=1
+            if [ -x "$script" ]; then
+                cd "$base" 2>/dev/null || exit 125
+                if [ "${BLOCKCHECK_TIMEOUT:-0}" -gt 0 ] 2>/dev/null; then
+                    timeout "$BLOCKCHECK_TIMEOUT" env BATCH=1 DOMAINS="$domains" DOMAINS_DEFAULT="$domains" TEST=standard SCANLEVEL="$mode" CURL_MAX_TIME="$BLOCKCHECK_CURL_MAX_TIME" CURL_MAX_TIME_QUIC="$BLOCKCHECK_CURL_MAX_TIME_QUIC" "$script"
+                    rc=$?
+                else
+                    BATCH=1 DOMAINS="$domains" DOMAINS_DEFAULT="$domains" TEST=standard SCANLEVEL="$mode" CURL_MAX_TIME="$BLOCKCHECK_CURL_MAX_TIME" CURL_MAX_TIME_QUIC="$BLOCKCHECK_CURL_MAX_TIME_QUIC" "$script"
+                    rc=$?
+                fi
+            else
+                printf '[ERROR] %s is not executable: %s\n' "$name" "${script:-NOT FOUND}"
+                rc=127
+            fi
+            printf '%s\n' "$rc" > "$status_file"
+            exit "$rc"
+        ) > "$fifo" 2>&1 &
+        isolated=0
+    fi
+    cmd_pid=$!
+    BLOCKCHECK_UPSTREAM_PID="$cmd_pid"
+    pgid="$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ' || true)"
+    printf '%s|%s|%s\n' "$cmd_pid" "$pgid" "$isolated" > "$RUN/active.blockcheck.pid"
+    BLOCKCHECK_RUNNING_PID="$cmd_pid"
+    interrupted=0
+
+    heartbeat=0
+    while [ ! -f "$status_file" ]; do
+        if [ "$interrupted" -eq 1 ]; then
+            break
+        fi
+        if ! kill -0 "$cmd_pid" 2>/dev/null; then
+            printf '125\n' > "$status_file"
+            break
+        fi
+        sleep 1
+        [ -f "$status_file" ] && continue
+        heartbeat=$((heartbeat+1))
+        if [ $((heartbeat % 5)) -eq 0 ] && [ "$interrupted" -eq 0 ]; then
+            now_epoch="$(date +%s)"
+            elapsed=$((now_epoch-start_epoch))
+            printf '[%s] %s | domain=%s | elapsed=%02d:%02d:%02d | pid=%s | strategy scan in progress\n' "$(t TAG_RUNNING)" "$label" "$domains" $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60)) "$cmd_pid"
+        fi
+    done
+
+    wait "$cmd_pid" 2>/dev/null || true
+    if [ -n "${BLOCKCHECK_READER_PID:-}" ]; then
+        wait "$BLOCKCHECK_READER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${BLOCKCHECK_SUMMARY_PID:-}" ]; then
+        wait "$BLOCKCHECK_SUMMARY_PID" 2>/dev/null || true
+    fi
+    if [ "$interrupted" -eq 0 ] && [ -p "$fifo" ]; then
+        sleep 1
+    fi
+    rc="$(cat "$status_file" 2>/dev/null || echo 125)"
+    case "$rc" in ''|*[!0-9]*) rc=125;; esac
+    end_epoch="$(date +%s)"
+    elapsed=$((end_epoch-start_epoch))
+    hours=$((elapsed/3600)); mins=$(((elapsed%3600)/60)); secs=$((elapsed%60))
+    status=COMPLETED
+    [ "$rc" -eq 130 ] && status=INTERRUPTED
+    [ "$interrupted" -eq 1 ] && status=INTERRUPTED && rc=130
+    [ "$rc" -ne 0 ] && [ "$status" = COMPLETED ] && status=EXITED_WITH_ERROR
+    cp -f "$out" "$latest"
+
+    # Restore the permanent signal dispatcher after this stage and clear markers.
+    SIGNAL_STAGE=""
+    rm -f "$fifo" "$sum_fifo" "$status_file" "$RUN/active.blockcheck.pid"
+    BLOCKCHECK_RUNNING_PID=""
+    BLOCKCHECK_RUNNING_ENGINE=""
+    BLOCKCHECK_RUNNING_LOG=""
+    BLOCKCHECK_READER_PID=""
+    BLOCKCHECK_SUMMARY_PID=""
+    BLOCKCHECK_UPSTREAM_PID=""
+
+    say '------------------------------------------------------------'
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        say "[ГОТОВО] Код выхода  : $rc"
+        say "[ГОТОВО] Статус      : $status"
+        say "[ГОТОВО] Длительность: $(printf '%02d:%02d:%02d' "$hours" "$mins" "$secs")"
+        say "[ГОТОВО] Raw-вывод   : $out"
+    else
+        say "[$(t TAG_DONE)] Upstream exit : $rc"
+        display_status="$status"
+        case "$status" in
+            INTERRUPTED) [ "${LANG_MODE:-RU}" = RU ] && display_status="$(t STATUS_INTERRUPTED)";;
+            COMPLETED) [ "${LANG_MODE:-RU}" = RU ] && display_status="$(t STATUS_COMPLETED)";;
+            EXITED_WITH_ERROR) [ "${LANG_MODE:-RU}" = RU ] && display_status="$(t STATUS_ERROR)";;
+        esac
+        say "[$(t TAG_DONE)] Status        : $display_status"
+        say "[$(t TAG_DONE)] Duration      : $(printf '%02d:%02d:%02d' "$hours" "$mins" "$secs")"
+        say "[$(t TAG_DONE)] Raw output    : $out"
+    fi
+    say '============================================================'
+    [ "$status" = INTERRUPTED ] && return 130
+    [ "$status" = EXITED_WITH_ERROR ] && return "$rc"
+    return 0
+}
+
+flush_pending_port() {
+    [ -n "${pending_port:-}" ] || return 0
+    case "${pending_port_state:-0}" in
+        1)
+            if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s] %s — %s\n" "$(t PORT)" "$pending_port" "$(colorize "$C_GREEN" "$(t ACCESS).")"; else say "[$(t PORT)] $pending_port — $(t ACCESS)."; fi
+            ;;
+        -1)
+            if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s] %s — %s\n" "$(t PORT)" "$pending_port" "$(colorize "$C_RED" "$(t NOACCESS).")"; else say "[$(t PORT)] $pending_port — $(t NOACCESS)."; fi
+            ;;
+        *)
+            if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s] %s — %s\n" "$(t PORT)" "$pending_port" "$(colorize "$C_YELLOW" "$(t PORT_UNKNOWN).")"; else say "[$(t PORT)] $pending_port — $(t PORT_UNKNOWN)."; fi
+            ;;
+    esac
+    pending_port=""
+    pending_port_state=0
+}
+translate_blockcheck_info() {
+    line="$1"
+    case "$line" in
+        *'checking prerequisites'*) say "[$(t TAG_INFO)] $(t INFO_PREREQ)" ;;
+        *'checking DNS'*) say "[$(t TAG_INFO)] $(t INFO_DNS)" ;;
+        *'searching working DoH server'*) say "[$(t TAG_INFO)] $(t INFO_DOH)" ;;
+        *'preparing nfqws2 redirection'*) say "[$(t TAG_INFO)] $(t INFO_NFQ_REDIRECT)" ;;
+        *'installed curl version does not support http3'*) say "[$(t TAG_INFO)] $(t INFO_HTTP3_DISABLED)" ;;
+        *'!!! WARNING. some dpi bypass processes already running !!!'*) say "[$(t TAG_WARNING)] $(t INFO_DPI_ALREADY_RUNNING)" ;;
+        *'!!! WARNING. blockcheck requires all DPI bypass methods disabled !!!'*) say "[$(t TAG_WARNING)] $(t INFO_DPI_REQUIRED_STOP)" ;;
+        *'!!! WARNING. pls stop all dpi bypass instances that may interfere with blockcheck !!!'*) say "[$(t TAG_WARNING)] $(t INFO_DPI_STOP_HINT)" ;;
+        *) say "[$(t TAG_INFO)] $line" ;;
+    esac
+}
+
+blockcheck_summary() {
+    label="$1"
+    idx=0
+    current=""
+    current_idx=0
+    pending_port=""
+    pending_port_state=0 # 0=unknown/not tested, 1=connects, -1=does not connect
+    available=0
+    unavailable=0
+    while IFS= read -r line; do
+        case "$line" in
+            \*\ script\ :*)
+                if [ -n "$current" ]; then
+                    if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s %03d] %s — %s\n" "$(t STRATEGY)" "$current_idx" "$current" "$(colorize "$C_YELLOW" "$(t RESULT): $(t STRATEGY_UNAVAILABLE)")"; else say "[$(t STRATEGY) $(printf '%03d' "$current_idx")] $current — $(t STRATEGY_UNAVAILABLE)"; fi
+                    unavailable=$((unavailable+1)); current=""; current_idx=0
+                fi
+                flush_pending_port
+                stage="${line#*: }"
+                if [ "$COLOR_ENABLED" = 1 ]; then printf "%s[%s]%s %s\n" "$C_BOLD" "$(t STAGE)" "$C_RESET" "$stage"; else say "[$(t STAGE)] $stage"; fi
+                ;;
+            -\ curl_test_*:\ *)
+                idx=$((idx+1))
+                flush_pending_port
+                current="${line#*: }"
+                current_idx=$idx
+                ;;
+            *'port block tests '*)
+                flush_pending_port
+                pending_port="${line#*\* }"
+                pending_port_state=0
+                ;;
+            *' connects')
+                [ -n "$pending_port" ] && pending_port_state=1
+                ;;
+            *' does not connect.'*)
+                [ -n "$pending_port" ] && pending_port_state=-1
+                ;;
+            *'suitable netcat not found'*)
+                if [ -n "$pending_port" ]; then
+                    if [ "${LANG_MODE:-RU}" = RU ]; then say "[$(t PORT)] $pending_port — $(t PORT_UNKNOWN). suitable netcat not found."; else say "[$(t PORT)] $pending_port — $(t PORT_UNKNOWN). suitable netcat not found."; fi
+                    pending_port=""
+                    pending_port_state=0
+                fi
+                ;;
+            *'!!!!! AVAILABLE !!!!!'*)
+                if [ -n "$current" ]; then
+                    available=$((available+1))
+                    if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s %03d] %s — %s\n" "$(t STRATEGY)" "$(printf '%03d' "$current_idx")" "$current" "$(colorize "$C_GREEN" "$(t ACCESS).")"; else say "[$(t STRATEGY) $(printf '%03d' "$current_idx")] $current — $(t ACCESS)."; fi
+                    current=""; current_idx=0
+                fi
+                flush_pending_port
+                ;;
+            *'UNAVAILABLE code='*)
+                detail="${line##*UNAVAILABLE }"
+                if [ -n "$current" ]; then
+                    unavailable=$((unavailable+1))
+                    if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s %03d] %s — %s\n" "$(t STRATEGY)" "$current_idx" "$current" "$(colorize "$C_RED" "$(t STRATEGY_UNAVAILABLE) — $detail")"; else say "[$(t STRATEGY) $(printf '%03d' "$current_idx")] $current — $(t STRATEGY_UNAVAILABLE) — $detail"; fi
+                    current=""; current_idx=0
+                fi
+                ;;
+            *'checking prerequisites'*|*'checking DNS'*|*'searching working DoH server'*|*'preparing nfqws2 redirection'*|*'installed curl version does not support http3'*|*WARNING*)
+                translate_blockcheck_info "$line"
+                ;;
+            *'curl: ('*)
+                ;;
+        esac
+    done
+    flush_pending_port
+    if [ -n "$current" ]; then
+        if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s %03d] %s — %s\n" "$(t STRATEGY)" "$current_idx" "$current" "$(colorize "$C_YELLOW" "$(t RESULT): $(t STRATEGY_UNAVAILABLE)")"; else say "[$(t STRATEGY) $(printf '%03d' "$current_idx")] $current — $(t STRATEGY_UNAVAILABLE)"; fi
+        unavailable=$((unavailable+1))
+    fi
+    say '------------------------------------------------------------'
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        say "[$(t TAG_SUMMARY)] $label: available=$available unavailable=$unavailable"
+    else
+        say "[SUMMARY] $label: AVAILABLE=$available NOT_WORKING=$unavailable"
+    fi
+}
+ask_save_blockcheck() {
+    pattern="$1"
+    if [ "${LANG_MODE:-RU}" = RU ]; then printf 'Сохранить raw-отчёт blockcheck? [y/N] '; else printf 'Save raw blockcheck report? [y/N] '; fi
+    read save || save=n
+    case "$save" in
+      y|Y)
+        say "[$(t TAG_SAVED)] Report remains in $BLOCKDIR"
+        ls -1t "$BLOCKDIR"/$pattern 2>/dev/null | head -n 10 || true
+        ;;
+      *)
+        for f in "$BLOCKDIR"/$pattern; do [ -f "$f" ] && rm -f "$f"; done
+        say "[$(t TAG_NOT_SAVED)] Raw blockcheck captures removed."
+        ;;
+    esac
+}
+
+strategy_hash() {
+    value="$1"
+    if has cksum; then
+        printf '%s' "$value" | cksum | awk '{print $1}'
+        return 0
+    fi
+    if has md5sum; then
+        printf '%s' "$value" | md5sum | awk '{print $1}'
+        return 0
+    fi
+    if has sha256sum; then
+        printf '%s' "$value" | sha256sum | awk '{print $1}'
+        return 0
+    fi
+    # Last-resort deterministic fallback for minimal BusyBox systems.
+    printf '%s' "$value" | awk 'BEGIN{h=5381} {for(i=1;i<=length($0);i++){c=substr($0,i,1); h=(h*33+index("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ -_./:=,",c)) % 2147483647}} END{print h}'
+
+}
+
+make_candidate_db() {
+    engine="$1"; src="$2"; cand="$3"; namespace="${4:-S}"
+    db="$BLOCKDIR/${engine}.db"; : > "$db"
+    n=0
+    case "$namespace" in
+        C) id_prefix="${engine}-C" ;;
+        *) id_prefix="${engine}-S" ;;
+    esac
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        n=$((n+1)); id="${id_prefix}$(printf '%04d' "$n")"
+        hash="$(strategy_hash "$line")"
+        printf '%s|%s|%s|CANDIDATE|%s\n' "$id" "$engine" "$hash" "$line" >> "$db"
+    done < "$cand"
+}
+
+# ---------- temporary NFQUEUE hook ----------
+kill_running() {
+    [ -f "$PIDFILE" ] || return 0
+    p="$(cat "$PIDFILE" 2>/dev/null || true)"
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    sleep 1
+    [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+    rm -f "$PIDFILE"
+}
+
+make_target_ips() {
+    : > "$RUN/target.v4"; : > "$RUN/target.v6"
+    while IFS= read -r s; do
+        rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ _ _ _ <<EOF2
+$rec
+EOF2
+        for d in $domains; do
+            resolve_ips_for_strategy "$d" | tr ' ' '\n' | while IFS= read -r ip; do
+                [ -n "$ip" ] || continue
+                case "$ip" in *:*) echo "$ip" >> "$RUN/target.v6";; *) echo "$ip" >> "$RUN/target.v4";; esac
+            done
+        done
+    done < "$STATE/services.list"
+    sort -u "$RUN/target.v4" -o "$RUN/target.v4" 2>/dev/null || true
+    sort -u "$RUN/target.v6" -o "$RUN/target.v6" 2>/dev/null || true
+}
+
+start_candidate_fw_nft() {
+    has nft || return 1
+    nft add table inet "$NFT_TABLE" || return 1
+    nft "add chain inet $NFT_TABLE out { type filter hook postrouting priority 101; policy accept; }" || return 1
+    nft "add chain inet $NFT_TABLE pre { type filter hook prerouting priority -101; policy accept; }" || return 1
+    nft "add rule inet $NFT_TABLE out meta mark and 0x10000000 != 0 return" || return 1
+    nft "add rule inet $NFT_TABLE pre meta mark and 0x10000000 != 0 return" || return 1
+    if [ -s "$RUN/target.v4" ]; then
+        ips="$(tr '\n' ',' < "$RUN/target.v4" | sed 's/,$//')"
+        nft "add rule inet $NFT_TABLE out ip daddr { $ips } tcp dport {80,443} queue num $QNUM bypass" || return 1
+        [ "$ENABLE_UDP" = 1 ] && nft "add rule inet $NFT_TABLE out ip daddr { $ips } udp dport 443 queue num $QNUM bypass" || true
+        nft "add rule inet $NFT_TABLE pre ip saddr { $ips } tcp sport {80,443} queue num $QNUM bypass" || true
+        [ "$ENABLE_UDP" = 1 ] && nft "add rule inet $NFT_TABLE pre ip saddr { $ips } udp sport 443 queue num $QNUM bypass" || true
+    fi
+    if [ "$TEST_IPV6" = 1 ] && [ -s "$RUN/target.v6" ]; then
+        ips6="$(tr '\n' ',' < "$RUN/target.v6" | sed 's/,$//')"
+        nft "add rule inet $NFT_TABLE out ip6 daddr { $ips6 } tcp dport {80,443} queue num $QNUM bypass" || return 1
+        [ "$ENABLE_UDP" = 1 ] && nft "add rule inet $NFT_TABLE out ip6 daddr { $ips6 } udp dport 443 queue num $QNUM bypass" || true
+        nft "add rule inet $NFT_TABLE pre ip6 saddr { $ips6 } tcp sport {80,443} queue num $QNUM bypass" || true
+        [ "$ENABLE_UDP" = 1 ] && nft "add rule inet $NFT_TABLE pre ip6 saddr { $ips6 } udp sport 443 queue num $QNUM bypass" || true
+    fi
+    return 0
+}
+
+start_candidate_fw_iptables() {
+    has iptables || return 1
+    iptables -t mangle -N "$IPT_CHAIN" 2>/dev/null || true
+    iptables -t mangle -F "$IPT_CHAIN" || return 1
+    iptables -t mangle -C OUTPUT -j "$IPT_CHAIN" 2>/dev/null || iptables -t mangle -A OUTPUT -j "$IPT_CHAIN" || return 1
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        iptables -t mangle -A "$IPT_CHAIN" -d "$ip" -p tcp -m multiport --dports 80,443 -j NFQUEUE --queue-num "$QNUM" --queue-bypass || return 1
+        [ "$ENABLE_UDP" = 1 ] && iptables -t mangle -A "$IPT_CHAIN" -d "$ip" -p udp --dport 443 -j NFQUEUE --queue-num "$QNUM" --queue-bypass || true
+    done < "$RUN/target.v4"
+    return 0
+}
+
+start_worker() {
+    engine="$1"; args="$2"
+    kill_running
+    case "$engine" in
+      ZAPRET)
+        [ -x "$NFQWS" ] || return 1
+        # Upstream requires --qnum on current zapret generations.
+        # Only qnum is injected by the harness; all desync options are candidate data.
+        # shellcheck disable=SC2086
+        "$NFQWS" --qnum="$QNUM" --dpi-desync-fwmark=0x10000000 $args >"$DEBUGDIR/worker.out" 2>"$DEBUGDIR/worker.err" &
+        ;;
+      ZAPRET2)
+        [ -x "$NFQWS2" ] || return 1
+        [ -f "$ZAPRET2_BASE/lua/zapret-lib.lua" ] || return 1
+        [ -f "$ZAPRET2_BASE/lua/zapret-antidpi.lua" ] || return 1
+        # These Lua libs are upstream zapret2 components, and are loaded explicitly by upstream init.
+        # shellcheck disable=SC2086
+        "$NFQWS2" --qnum="$QNUM" --fwmark=0x10000000 --lua-init=@"$ZAPRET2_BASE/lua/zapret-lib.lua" --lua-init=@"$ZAPRET2_BASE/lua/zapret-antidpi.lua" $args >"$DEBUGDIR/worker.out" 2>"$DEBUGDIR/worker.err" &
+        ;;
+      *) return 1;;
+    esac
+    echo $! > "$PIDFILE"
+    sleep 1
+    kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+# ---------- strategy verification ----------
+test_domain_set() {
+    engine="$1"; args="$2"; attempts="$3"; strategy="$4"
+    make_target_ips || true
+    case "$FWTYPE" in nftables) start_candidate_fw_nft;; *) start_candidate_fw_iptables;; esac || return 1
+    start_worker "$engine" "$args" || { cleanup_ours; return 1; }; sleep "$WAIT_AFTER_RESTART"
+    pass=0; total=0; untested=0; : > "$RUN/current-results"
+    while IFS= read -r s; do
+        rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ htt https quic <<EOF2
+$rec
+EOF2
+        for d in $domains; do
+            a=1
+            while [ "$a" -le "$attempts" ]; do
+                dns="$(dns_probe "$d" 2>/dev/null || true)"; resolve_ip=""
+                case "$dns" in
+                    PASS\|*) resolve_ip="$(printf '%s' "$dns" | cut -d'|' -f2)";;
+                    DNS_SYNTHETIC*|DNS_FAILURE*) doh_result="$(dns_integrity_probe "$d" 2>/dev/null || true)"; resolve_ip="$(printf '%s' "$doh_result" | cut -d'|' -f4)"; [ -n "$resolve_ip" ] && dns="PASS|$resolve_ip|DOH";;
+                esac
+                if [ -z "$resolve_ip" ] || is_synthetic_ip "$resolve_ip"; then
+                    untested=$((untested+1)); echo "$s|$d|${dns:-NO_DATA}|NA|NA|NA" >> "$RUN/current-results"; a=$((a+1)); continue
+                fi
+                total=$((total+1)); http="NA"; httpsr="NA"; h3="NA"; curl_resolve="--resolve ${d}:80:${resolve_ip} --resolve ${d}:443:${resolve_ip}"
+                [ "$htt" = 1 ] && http="$(curl_probe "http://$d" "$curl_resolve")"
+                [ "$https" = 1 ] && httpsr="$(curl_probe "https://$d" "$curl_resolve")"
+                [ "$ENABLE_HTTP3" = 1 ] && [ "$quic" = 1 ] && { if http3_capable; then h3="$(curl_probe "https://$d" "$curl_resolve --http3-only")"; else h3='2|UNAVAILABLE|0|NA|'; fi; }
+                echo "$s|$d|$dns|$http|$httpsr|$h3" >> "$RUN/current-results"
+                case "$httpsr" in *'|PASS|'*|0'|PASS|'*) pass=$((pass+1));; esac
+                a=$((a+1))
+            done
+        done
+    done < "$STATE/services.list"
+    kill_running; cleanup_ours; printf '%s|%s|%s\n' "$pass" "$total" "$untested"
+}
+
+control_test() {
+    strategy="$1"; args="$2"; engine="$3"
+    [ -f "$CONTROL" ] || { echo 0; return; }
+    make_target_ips || true
+    case "$FWTYPE" in nftables) start_candidate_fw_nft;; *) start_candidate_fw_iptables;; esac || { echo 1; return; }
+    start_worker "$engine" "$args" || { cleanup_ours; echo 1; return; }; sleep "$WAIT_AFTER_RESTART"
+    failures=0; checked=0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        dns="$(dns_probe "$d" 2>/dev/null || true)"; ip=""
+        case "$dns" in PASS\|*) ip="$(printf '%s' "$dns" | cut -d'|' -f2)";; DNS_SYNTHETIC*|DNS_FAILURE*) r="$(dns_integrity_probe "$d" 2>/dev/null || true)"; ip="$(printf '%s' "$r" | cut -d'|' -f4)";; esac
+        [ -n "$ip" ] && ! is_synthetic_ip "$ip" || continue
+        checked=$((checked+1)); r="$(curl_probe "https://$d" "--resolve ${d}:443:${ip}")"; echo "$r" | grep -q '|PASS|' || failures=$((failures+1))
+    done < "$CONTROL"
+    kill_running; cleanup_ours; [ "$checked" -gt 0 ] && echo "$failures" || echo 0
+}
+
+score_result() {
+    pass="$1"; total="$2"; regress="$3"; side="$4"; ms="$5"
+    [ "$total" -gt 0 ] || { echo 0; return; }
+    base=$((pass*70/total))
+    [ "$regress" -gt 0 ] && base=$((base-regress*10))
+    [ "$side" -gt 0 ] && base=$((base-side*10))
+    [ "$ms" -lt 1000 ] && base=$((base+10))
+    [ "$base" -lt 0 ] && base=0
+    [ "$base" -gt 100 ] && base=100
+    echo "$base"
+}
+
+run_strategy_tests() {
+    engine="$1"; db="$2"; attempts="$3"
+    [ -f "$RUN/strategy-results" ] || : > "$RUN/strategy-results"
+    n=0
+    STRATEGY_INTERRUPTED=0
+    STRATEGY_RUNNING_PID=""
+    strategy_signal_handler() {
+        STRATEGY_INTERRUPTED=1
+        if [ -n "${STRATEGY_RUNNING_PID:-}" ]; then
+            kill_tree "$STRATEGY_RUNNING_PID" >/dev/null 2>&1 || true
+            kill -KILL "$STRATEGY_RUNNING_PID" 2>/dev/null || true
+        fi
+        rm -f "$RUN/active.strategy.pid"
+    }
+    SIGNAL_STAGE=strategy
+    while IFS='|' read -r id eng hash status args; do
+        [ "$eng" = "$engine" ] || continue
+        n=$((n+1))
+        say ''
+        if [ "$COLOR_ENABLED" = 1 ]; then printf "%s[%s] %s%s\n" "$C_CYAN" "$engine" "$id" "$C_RESET"; else say "[$engine] $id"; fi
+        start=$(now_ms)
+        result_file="$RUN/strategy-${engine}-${n}.result"
+        rm -f "$result_file"
+        STRATEGY_INTERRUPTED=0
+        timeout_run test_domain_set "$engine" "$args" "$attempts" "$id" >"$result_file" 2>&1 &
+        STRATEGY_RUNNING_PID=$!
+        printf '%s\n' "$STRATEGY_RUNNING_PID" > "$RUN/active.strategy.pid"
+        wait "$STRATEGY_RUNNING_PID" 2>/dev/null
+        rc=$?
+        end=$(now_ms); elapsed=$((end-start))
+        rm -f "$RUN/active.strategy.pid"
+        STRATEGY_RUNNING_PID=""
+
+        if [ "$STRATEGY_INTERRUPTED" = 1 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
+            status2=SKIPPED; score=0; pass=0; total=0; side=0
+            printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$engine" "$args" "$status2" "$score" "0/0" "$side" >> "$RUN/strategy-results"
+            display_status="$status2"
+            [ "${LANG_MODE:-RU}" = RU ] && display_status="$(t STATUS_SKIPPED)"
+            if [ "$COLOR_ENABLED" = 1 ]; then
+                label_status="$(colorize "$C_YELLOW" "$display_status")"
+            else
+                label_status="$display_status"
+            fi
+            printf '%-14s %-9s score=%-3s pass=%s elapsed=%sms side=%s\n' "$id" "$label_status" "$score" "0/0" "$elapsed" "$side"
+            printf '%-14s %-9s score=%-3s pass=%s elapsed=%sms side=%s\n' "$id" "$status2" "$score" "0/0" "$elapsed" "$side" >> "$REPORT_TXT"
+            rm -f "$result_file"
+            continue
+        fi
+
+        result="$(cat "$result_file" 2>/dev/null || true)"
+        pass="$(printf '%s\n' "$result" | awk -F'|' '{print $1}' | tail -n1)"
+        total="$(printf '%s\n' "$result" | awk -F'|' '{print $2}' | tail -n1)"
+        untested="$(printf '%s\n' "$result" | awk -F'|' '{print $3}' | tail -n1)"
+        case "$pass" in ''|*[!0-9]*) pass=0;; esac
+        case "$total" in ''|*[!0-9]*) total=0;; esac
+        case "$untested" in ''|*[!0-9]*) untested=0;; esac
+        if [ "$total" -eq 0 ]; then
+            side=0; score=0; status2=SKIPPED
+            printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$engine" "$args" "$status2" "$score" "0/0" "$side" >> "$RUN/strategy-results"
+            display_status="$status2"; [ "${LANG_MODE:-RU}" = RU ] && display_status="$(t STATUS_SKIPPED)"
+            printf '%-14s %-11s score=%-3s pass=%s elapsed=%sms side=%s untested=%s\n' "$id" "$display_status" "$score" "0/0" "$elapsed" "$side" "$untested"
+            printf '%-14s %-9s score=%-3s pass=%s elapsed=%sms side=%s untested=%s\n' "$id" "$status2" "$score" "0/0" "$elapsed" "$side" "$untested" >> "$REPORT_TXT"
+            rm -f "$result_file"
+            continue
+        fi
+        side="$(control_test "$id" "$args" "$engine")"
+        [ -n "$side" ] || side=0
+        score="$(score_result "$pass" "$total" 0 "$side" "$elapsed")"
+        status2=FAIL; [ "$pass" -gt 0 ] && status2=PARTIAL; [ "$pass" -ge "$total" ] && [ "$total" -gt 0 ] && status2=PASS
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$engine" "$args" "$status2" "$score" "$pass/$total" "$side" >> "$RUN/strategy-results"
+        if [ "$COLOR_ENABLED" = 1 ]; then
+            display_status="$status2"
+            if [ "${LANG_MODE:-RU}" = RU ]; then
+                case "$status2" in
+                    PASS) display_status="$(t STATUS_PASS)";;
+                    PARTIAL) display_status="$(t STATUS_PARTIAL)";;
+                    FAIL) display_status="$(t STATUS_FAIL)";;
+                    SKIPPED) display_status="$(t STATUS_SKIPPED)";;
+                esac
+            fi
+            case "$status2" in
+                PASS) label_status="$(colorize "$C_GREEN" "$display_status")";;
+                PARTIAL) label_status="$(colorize "$C_YELLOW" "$display_status")";;
+                *) label_status="$(colorize "$C_RED" "$display_status")";;
+            esac
+            printf '%-14s %-11s score=%-3s pass=%s elapsed=%sms side=%s\n' "$id" "$label_status" "$score" "$pass/$total" "$elapsed" "$side"
+        else
+            display_status="$status2"
+            if [ "${LANG_MODE:-RU}" = RU ]; then
+                case "$status2" in
+                    PASS) display_status="$(t STATUS_PASS)";;
+                    PARTIAL) display_status="$(t STATUS_PARTIAL)";;
+                    FAIL) display_status="$(t STATUS_FAIL)";;
+                    SKIPPED) display_status="$(t STATUS_SKIPPED)";;
+                esac
+            fi
+            printf '%-14s %-11s score=%-3s pass=%s elapsed=%sms side=%s\n' "$id" "$display_status" "$score" "$pass/$total" "$elapsed" "$side"
+        fi
+        printf '%-14s %-9s score=%-3s pass=%s elapsed=%sms side=%s\n' "$id" "$status2" "$score" "$pass/$total" "$elapsed" "$side" >> "$REPORT_TXT"
+        rm -f "$result_file"
+    done < "$db"
+    SIGNAL_STAGE=""
+    STRATEGY_RUNNING_PID=""
+}
+
+timeout_run() { internal_timeout "$STRATEGY_TIMEOUT" "$@"; }
+
+# ---------- blockcheck orchestration ----------
+run_engine_blockcheck() {
+    engine="$1"
+    namespace="${2:-S}"
+    if [ -s "$STATE/blockcheck.domain" ]; then
+        all="$(cat "$STATE/blockcheck.domain" 2>/dev/null)"
+    else
+        all=""
+    fi
+    [ -n "$all" ] || return 1
+    say ''
+    say "[$(t TAG_TARGET)]"
+    if [ -s "$STATE/blockcheck.service" ]; then
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Сервис: $(cat "$STATE/blockcheck.service")"; else say "  Service: $(cat "$STATE/blockcheck.service")"; fi
+    fi
+    if [ "${LANG_MODE:-RU}" = RU ]; then say "  Домен : $all"; else say "  Domain : $all"; fi
+    case "$engine" in
+      ZAPRET) [ -n "$BLOCKCHECK" ] || return 1; run_blockcheck ZAPRET "$all" "$BLOCKCHECK_SCANLEVEL"; run_rc=$?;;
+      ZAPRET2) [ -n "$BLOCKCHECK2" ] || return 1; run_blockcheck ZAPRET2 "$all" "$BLOCKCHECK_SCANLEVEL"; run_rc=$?;;
+      *) return 1;;
+    esac
+    # Never parse/generate candidate databases after an interrupted or failed
+    # upstream blockcheck. This is what previously caused Sxxxx output after ^C.
+    case "$run_rc" in
+        130|143) return "$run_rc";;
+        0) :;;
+        *) return "$run_rc";;
+    esac
+    case "$engine" in
+      ZAPRET) raw="$BLOCKDIR/blockcheck-latest.txt";;
+      ZAPRET2) raw="$BLOCKDIR/blockcheck2-latest.txt";;
+    esac
+    [ -f "$raw" ] || return 1
+    if ! grep -Eq '\* script :|!!!!! AVAILABLE !!!!!|UNAVAILABLE code=' "$raw" 2>/dev/null; then
+        say "[$(t TAG_WARNING)] Upstream blockcheck completed without any strategy test results."
+    fi
+    cand="$(extract_candidates "$raw" "$engine")"
+    make_candidate_db "$engine" "$raw" "$cand" "$namespace"
+}
+
+# ---------- report ----------
+generate_best_configs() {
+    rm -f "$BEST_Z" "$BEST_Z2"
+    for e in ZAPRET ZAPRET2; do
+        [ -s "$RUN/strategy-results" ] || continue
+        best="$(awk -F'|' -v e="$e" '$2==e && $4=="PASS" {print $5"|"$1"|"$3} ' "$RUN/strategy-results" | sort -t'|' -k1,1nr | head -n1)"
+        [ -n "$best" ] || best="$(awk -F'|' -v e="$e" '$2==e {print $5"|"$1"|"$3} ' "$RUN/strategy-results" | sort -t'|' -k1,1nr | head -n1)"
+        [ -n "$best" ] || continue
+        score=$(echo "$best" | cut -d'|' -f1)
+        id=$(echo "$best" | cut -d'|' -f2)
+        args=$(echo "$best" | cut -d'|' -f3-)
+        if [ "$e" = ZAPRET ]; then
+          cat > "$BEST_Z" <<EOF2
+# Generated by zapret-test.
+# STATUS=VERIFIED only when the report shows PASS.
+ID=$id
+ENGINE=$e
+SCORE=$score
+COMMAND=$args
+EOF2
+        else
+          cat > "$BEST_Z2" <<EOF2
+# Generated by zapret-test.
+# STATUS=VERIFIED only when the report shows PASS.
+ID=$id
+ENGINE=$e
+SCORE=$score
+COMMAND=$args
+EOF2
+        fi
+    done
+}
+
+finalize_report() {
+    generate_best_configs
+    {
+      echo
+      echo '=================================================='
+      echo 'FINAL RESULT'
+      echo '=================================================='
+      echo "ENGINE ZAPRET: ${ZAPRET_VERSION:-UNAVAILABLE}"
+      echo "ENGINE ZAPRET2: ${ZAPRET2_VERSION:-UNAVAILABLE}"
+      echo "FW: $FW"
+      echo "SELECTED SERVICES:"
+      cat "$STATE/services.list" | sed 's/^/  /'
+      echo
+      echo 'TOP STRATEGIES'
+      if [ -s "$RUN/strategy-results" ]; then
+        sort -t'|' -k5,5nr "$RUN/strategy-results" | head -n 10 | awk -F'|' '{printf "  %-12s %-8s SCORE=%-3s SERVICES=%-7s SIDE_EFFECT=%s\n",$1,$4,$5,$6,$7}'
+      else echo '  NONE'; fi
+      echo
+      echo 'BLOCKCHECK RAW:'
+      ls -l "$BLOCKDIR" 2>/dev/null || true
+      echo
+      echo 'EXTERNAL / VPS-STYLE TESTS:'
+      ls -l "$EXTERNAL_DIR"/*.txt 2>/dev/null || echo '  NONE'
+      echo
+      echo 'RESTORE STATUS:' "$([ "$ROLLBACK_OK" = 1 ] && echo OK || echo CRITICAL)"
+      echo
+      echo 'IMPORTANT: blockcheck output is candidate evidence; only strategies verified by the real-world test are recommendations.'
+    } >> "$REPORT_TXT"
+    # Keep JSON deliberately generated from machine-readable result files instead of complex sed on a template.
+    {
+      echo '{'
+      printf '  "system":{"openwrt":"%s","target":"%s","arch":"%s","device":"%s","kernel":"%s","firewall":"%s","ipv6":"%s"},\n' "$(json_escape "$OW_DESCRIPTION")" "$(json_escape "$OW_TARGET")" "$(json_escape "$ARCH")" "$(json_escape "${DEVICE_MODEL:-unknown}")" "$(json_escape "$KERNEL")" "$(json_escape "$FW")" "$(json_escape "$IPV6_STATE")"
+      echo '  "selected_services":['
+      first=1; while IFS= read -r s; do [ "$first" = 1 ] || printf ',\n'; first=0; printf '    "%s"' "$(json_escape "$s")"; done < "$STATE/services.list"; echo; echo '  ],'
+      echo '  "strategies":['
+      first=1; if [ -s "$RUN/strategy-results" ]; then while IFS='|' read -r id eng args st sc svc side; do
+        [ "$first" = 1 ] || printf ',\n'; first=0
+        printf '    {"id":"%s","engine":"%s","status":"%s","score":%s,"services":"%s","side_effects":%s,"args":"%s"}' \
+          "$(json_escape "$id")" "$(json_escape "$eng")" "$(json_escape "$st")" "$sc" "$(json_escape "$svc")" "$side" "$(json_escape "$args")"
+      done < "$RUN/strategy-results"; fi
+      echo; echo '  ],'
+      echo '  "restore_status":"'"$([ "$ROLLBACK_OK" = 1 ] && echo OK || echo CRITICAL)"'"'
+      echo '}'
+    } > "$REPORT_JSON"
+}
+
+format_system_header() {
+    say "$(t MAIN_SYSTEM)"
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Версия OpenWrt : ${OW_DESCRIPTION:-unknown}"; else say "  OpenWrt        : ${OW_DESCRIPTION:-unknown}"; fi
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Платформа      : ${OW_TARGET:-unknown}"; else say "  Platform       : ${OW_TARGET:-unknown}"; fi
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Архитектура    : ${OW_ARCH:-$ARCH}"; else say "  Architecture   : ${OW_ARCH:-$ARCH}"; fi
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Устройство     : ${DEVICE_MODEL:-unknown}"; else say "  Device         : ${DEVICE_MODEL:-unknown}"; fi
+        if [ "${LANG_MODE:-RU}" = RU ]; then say "  Ядро Linux     : ${KERNEL:-unknown}"; else say "  Linux kernel   : ${KERNEL:-unknown}"; fi
+        say "  Firewall       : ${FW:-unknown}"
+        say "  IPv6           : ${IPV6_STATE:-unknown}"
+    else
+        say "  OpenWrt        : ${OW_DESCRIPTION:-unknown}"
+        say "  Platform       : ${OW_TARGET:-unknown}"
+        say "  Architecture   : ${OW_ARCH:-$ARCH}"
+        say "  Device         : ${DEVICE_MODEL:-unknown}"
+        say "  Linux kernel   : ${KERNEL:-unknown}"
+        say "  Firewall       : ${FW:-unknown}"
+        say "  IPv6           : ${IPV6_STATE:-unknown}"
+    fi
+    say ""
+    say "$(t MAIN_COMPONENTS)"
+    say "  zapret         : ${NFQWS:-NOT FOUND}"
+    say "  blockcheck     : ${BLOCKCHECK:-NOT INSTALLED}"
+    say "  zapret2        : ${NFQWS2:-NOT FOUND}"
+    say "  blockcheck2    : ${BLOCKCHECK2:-NOT INSTALLED}"
+}
+
+show_detect() {
+    detect_system; detect_zapret; detect_zapret2
+    ZAPRET_VERSION="$(get_version "$NFQWS")"; ZAPRET2_VERSION="$(get_version "$NFQWS2")"
+    format_system_header
+    say "$(t PROGRAM_VERSION): $VERSION"
+    say "$(t ZAPRET_VERSION) : $ZAPRET_VERSION"
+    say "$(t ZAPRET2_VERSION) : $ZAPRET2_VERSION"
+    say "DNS             : ${DNS_SERVERS:-UNAVAILABLE}"
+    say "curl            : $($CURL --version 2>/dev/null | head -n1)"
+    if http3_capable; then if [ "${LANG_MODE:-RU}" = RU ]; then say 'HTTP/3 у curl    : ДОСТУПЕН'; else say 'curl HTTP/3     : AVAILABLE'; fi; else if [ "${LANG_MODE:-RU}" = RU ]; then say 'HTTP/3 у curl    : НЕДОСТУПЕН'; else say 'curl HTTP/3     : UNAVAILABLE'; fi; fi
+}
+
+
+# ---------- interactive UI ----------
+
+ui_blockcheck_menu() {
+    while :; do
+        clear 2>/dev/null || true
+        say '=============================================='
+        say " $(t BLOCKCHECK_MENU)"
+        say '=============================================='
+        say "[1] $(t BC1)"
+        say "[2] $(t BC2)"
+        say "[3] $(t BCBOTH)"
+        say "[0] $(t BACK)"
+        t SELECT; read e || return 0
+        case "$e" in
+            1) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck1; ui_pause;;
+            2) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck2; ui_pause;;
+            3) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck; ui_pause;;
+            0|q|Q) return 0;;
+            *) say "$(t INVALID)"; ui_pause;;
+        esac
+    done
+}
+
+ui_service_menu() {
+    while :; do
+        clear 2>/dev/null || true
+        say '=============================================='
+        say " $(t SERVICE_MENU)"
+        say '=============================================='
+        say "[1] $(t REQ)"
+        say "[2] $(t DETECT)"
+        say "[3] $(t RESTORE)"
+        say "[4] $(t REPORT)"
+        say "[5] $(t DEBUG)"
+        say "[6] $(t STOP)"
+        say "[7] $(t MANAGE_CUSTOM)"
+        say "[0] $(t BACK)"
+        t SELECT; read e || return 0
+        case "$e" in
+            1) requirements_status; ui_pause;;
+            2) show_detect; ui_pause;;
+            3) cmd_restore; ui_pause;;
+            4) cmd_report; ui_pause;;
+            5) [ -s "$STATE/services.list" ] || { ui_profile || true; }; [ -s "$STATE/services.list" ] || { say "$(t NO_SERVICES)"; ui_pause; continue; }; cmd_debug; ui_pause;;
+            6) stop_active_test || true; ui_pause;;
+            7) manage_custom_services;;
+            0|q|Q) return 0;;
+            *) say "$(t INVALID)"; ui_pause;;
+        esac
+    done
+}
+
+
+ui_services() {
+    ensure_default_files
+    select_services_interactive
+}
+
+ui_profile() {
+    select_services_interactive
+}
+
+ui_engine() {
+    say ''
+    say '=============================================='
+    say " $(t SELECT_ENGINE)"
+    say '=============================================='
+    ENGINE_MENU_FILE="$STATE/engine-menu"
+    : > "$ENGINE_MENU_FILE"
+    n=1
+    if [ -n "${NFQWS:-}" ]; then
+        printf '[%d] zapret\n' "$n"
+        printf '%d|ZAPRET\n' "$n" >> "$ENGINE_MENU_FILE"
+        n=$((n+1))
+    fi
+    if [ -n "${NFQWS2:-}" ]; then
+        printf '[%d] zapret2\n' "$n"
+        printf '%d|ZAPRET2\n' "$n" >> "$ENGINE_MENU_FILE"
+        n=$((n+1))
+    fi
+    [ -s "$ENGINE_MENU_FILE" ] || { say "$(t NO_ENGINE)"; ENGINE_SELECTION=NONE; return 1; }
+    printf '[%d] %s\n' "$n" "$(t AUTOMATIC_ENGINE)"
+    printf '%d|AUTO\n' "$n" >> "$ENGINE_MENU_FILE"
+    say "[0] $(t EXIT)"
+    default="$n"
+    printf '%s [%d]: ' "$(t SELECT)" "$default"
+    read e
+    [ -n "$e" ] || e="$default"
+    case "$e" in 0|q|Q) return 0;; esac
+    ENGINE_SELECTION="$(awk -F'|' -v n="$e" '$1==n{print $2; exit}' "$ENGINE_MENU_FILE")"
+    [ -n "$ENGINE_SELECTION" ] || { say "$(t INVALID_ENGINE)"; ENGINE_SELECTION=AUTO; }
+}
+
+interactive_menu() {
+    need_root
+    ensure_default_files
+    load_config
+    choose_language
+    sync_domain_lists
+    detect_system
+    detect_zapret
+    detect_zapret2
+    ZAPRET_VERSION="$(get_version "$NFQWS")"
+    ZAPRET2_VERSION="$(get_version "$NFQWS2")"
+
+    while :; do
+        clear 2>/dev/null || true
+        say '============================================================'
+        say "                     ZAPRET-TEST $VERSION"
+        say '============================================================'
+        format_system_header
+        say "  $(t TEST_ENGINE) : ${ENGINE_SELECTION:-AUTO}"
+        say '------------------------------------------------------------'
+        say "[1] $(t QUICK)"
+        say "[2] $(t FULL)"
+        say "[3] $(t AUTO)"
+        say "[4] $(t BASELINE)"
+        say "[5] $(t ENGINE)"
+        say "[6] $(t BLOCKCHECK_MENU)"
+        say "[7] $(t AVAIL_MENU)"
+        say "[8] $(t CUSTOM)"
+        say "[77] $(t SERVICE_MENU)"
+        say "[0] $(t EXIT)"
+        say '------------------------------------------------------------'
+        t SELECT
+        read choice || return 0
+
+        case "$choice" in
+            1)
+                ui_profile || true
+                [ -s "$STATE/services.list" ] || { say "$(t NO_SERVICES)"; ui_pause; continue; }
+                cmd_quick; ui_pause ;;
+            2)
+                ui_profile || true
+                [ -s "$STATE/services.list" ] || { say "$(t NO_SERVICES)"; ui_pause; continue; }
+                cmd_full; ui_pause ;;
+            3)
+                ui_profile || true
+                [ -s "$STATE/services.list" ] || { say "$(t NO_SERVICES)"; ui_pause; continue; }
+                cmd_auto; ui_pause ;;
+            4)
+                ui_services || true
+                cmd_baseline_selected; ui_pause ;;
+            5)
+                ui_engine
+                say "$(t ENGINE_SELECTED): $ENGINE_SELECTION"
+                ui_pause ;;
+            6)
+                ui_blockcheck_menu ;;
+            7)
+                cmd_external ;;
+            8)
+                cmd_custom; ui_pause ;;
+            77)
+                ui_service_menu ;;
+            0|q|Q|exit)
+                return 0 ;;
+            *)
+                t INVALID_SELECTION
+                ui_pause ;;
+        esac
+    done
+}
+
+# ---------- commands ----------
+cmd_services() {
+    ensure_default_files
+    parse_services | awk -F'|' '{printf "%-14s %s\n",$1,$3}'
+}
+
+cmd_baseline_selected() {
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; report_init
+    [ -s "$STATE/services.list" ] || select_services_interactive
+    baseline; finalize_report; say "Report: $REPORT_TXT"
+}
+
+cmd_baseline() {
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; report_init; select_services_interactive; baseline; finalize_report; say "Report: $REPORT_TXT"
+}
+
+cmd_blockcheck_engine() {
+    engine="$1"
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; report_init
+    if [ -z "$(cat "$STATE/blockcheck.domain" 2>/dev/null || true)" ]; then
+        [ -s "$STATE/services.list" ] && set_first_blockcheck_target || select_blockcheck_target || return 1
+    fi
+    if [ "$engine" = ZAPRET ] && [ -z "${BLOCKCHECK:-}" ]; then say 'zapret/blockcheck.sh: NOT FOUND'; return 1; fi
+    if [ "$engine" = ZAPRET2 ] && [ -z "${BLOCKCHECK2:-}" ]; then say 'zapret2/blockcheck2.sh: NOT FOUND'; return 1; fi
+    backup_create
+    stop_engine_services || { say 'failed to stop installed services'; return 1; }
+    run_engine_blockcheck "$engine"
+    run_rc=$?
+    restore_all || { ROLLBACK_OK=0; say 'CRITICAL: service restore failed'; return 1; }
+    [ "$run_rc" -eq 130 ] && { say '[INTERRUPTED] Blockcheck stopped by user.'; finalize_report; return 130; }
+    [ "$run_rc" -ne 0 ] && { say "Could not run $engine blockcheck."; return "$run_rc"; }
+    finalize_report
+    say "Blockcheck results directory: $BLOCKDIR"
+    ls -1t "$BLOCKDIR"/blockcheck*.txt 2>/dev/null | head -n 5 || true
+    ask_save_blockcheck "blockcheck*.txt"
+}
+
+cmd_blockcheck1() { cmd_blockcheck_engine ZAPRET; }
+cmd_blockcheck2() { cmd_blockcheck_engine ZAPRET2; }
+cmd_blockcheck() {
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; report_init
+    [ -s "$STATE/blockcheck.domain" ] || { [ -s "$STATE/services.list" ] && set_first_blockcheck_target || select_blockcheck_target || return 1; }
+    backup_create
+    stop_engine_services || { say 'failed to stop installed services'; return 1; }
+    any=0
+    for e in ZAPRET ZAPRET2; do
+        case "$e" in
+            ZAPRET) [ -n "${BLOCKCHECK:-}" ] || continue;;
+            ZAPRET2) [ -n "${BLOCKCHECK2:-}" ] || continue;;
+        esac
+        any=1
+        run_engine_blockcheck "$e" S
+        run_rc=$?
+        if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
+            interrupted=1
+            break
+        fi
+    done
+    [ "$any" = 1 ] || { say 'Neither blockcheck.sh nor blockcheck2.sh was detected.'; return 1; }
+    if [ "${interrupted:-0}" = 1 ]; then
+        restore_all || { ROLLBACK_OK=0; }
+        finalize_report
+        return 130
+    fi
+    restore_all || { ROLLBACK_OK=0; say 'CRITICAL: service restore failed'; return 1; }
+    finalize_report
+    say "Blockcheck results directory: $BLOCKDIR"
+    ls -1t "$BLOCKDIR"/blockcheck*.txt 2>/dev/null | head -n 10 || true
+    ask_save_blockcheck "blockcheck*.txt"
+}
+
+engines_to_test() {
+    case "${ENGINE_SELECTION:-AUTO}" in
+        ZAPRET) [ -n "${NFQWS:-}" ] && echo ZAPRET ;;
+        ZAPRET2) [ -n "${NFQWS2:-}" ] && echo ZAPRET2 ;;
+        *)
+            [ -n "${NFQWS:-}" ] && echo ZAPRET
+            [ -n "${NFQWS2:-}" ] && echo ZAPRET2
+            ;;
+    esac
+}
+
+cmd_test() {
+    ensure_default_files; detect_system; detect_zapret; detect_zapret2; report_init; [ -f "$STATE/services.list" ] || select_services_interactive
+    DEEP_DIAGNOSTICS=0
+    : > "$RUN/strategy-results"
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    baseline
+    backup_create; stop_engine_services || die 'failed to stop installed services'
+    set_first_blockcheck_target || { say "$(t NO_VALID_BC_DOMAINS)"; return 1; }
+    test_interrupted=0
+    for e in $(engines_to_test); do
+        db="$BLOCKDIR/${e}.db"
+        rm -f "$db" "$BLOCKDIR/${e}.candidates"
+        run_engine_blockcheck "$e" S
+        run_rc=$?
+        if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
+            test_interrupted=1
+            break
+        fi
+        [ "$run_rc" -eq 0 ] || continue
+        [ -s "$db" ] || continue
+        run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
+    done
+    if ! restore_all; then say 'CRITICAL: rollback failed; stopping further processing'; ROLLBACK_OK=0; fi
+    if [ "$test_interrupted" = 1 ]; then
+        say "[$(t TAG_STOP)] Test chain interrupted; candidate verification was not started on partial blockcheck data."
+        finalize_report
+        return 130
+    fi
+    finalize_report
+    say "Report: $REPORT_TXT"
+    say "JSON:   $REPORT_JSON"
+}
+
+cmd_quick() {
+    ensure_default_files; load_config; ATTEMPTS="$QUICK_ATTEMPTS"; FULL_MAX_CANDIDATES="$QUICK_MAX_CANDIDATES"; BLOCKCHECK_SCANLEVEL=quick; cmd_test
+}
+
+cmd_full() {
+    ensure_default_files; load_config; ATTEMPTS=3; FULL_MAX_CANDIDATES=0; BLOCKCHECK_SCANLEVEL=force; cmd_test
+}
+
+cmd_auto() {
+    ensure_default_files; load_config; ATTEMPTS=3; FULL_MAX_CANDIDATES=0; BLOCKCHECK_SCANLEVEL=standard; detect_system; detect_zapret; detect_zapret2; report_init
+    [ -s "$STATE/services.list" ] || select_services_interactive
+    DEEP_DIAGNOSTICS=0
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    backup_create; service_status; baseline
+    stop_engine_services || die 'could not stop existing zapret services safely'
+    set_first_blockcheck_target || { say "$(t NO_VALID_BC_DOMAINS)"; return 1; }
+    : > "$RUN/strategy-results"
+    for e in $(engines_to_test); do
+      db="$BLOCKDIR/${e}.db"; rm -f "$db" "$BLOCKDIR/${e}.candidates"
+      run_engine_blockcheck "$e" S
+      run_rc=$?
+      if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
+          interrupted=1
+          break
+      fi
+      [ "$run_rc" -eq 0 ] || continue
+      [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
+    done
+    restore_all || { ROLLBACK_OK=0; say 'CRITICAL: rollback failed'; }
+    if [ "${interrupted:-0}" = 1 ]; then
+        finalize_report
+        return 130
+    fi
+    finalize_report
+    say 'AUTO COMPLETE'
+    say "Report: $REPORT_TXT"
+}
+
+cmd_debug() {
+    ensure_default_files; load_config; ATTEMPTS=3; FULL_MAX_CANDIDATES=0; BLOCKCHECK_SCANLEVEL=force; detect_system; detect_zapret; detect_zapret2; report_init
+    [ -s "$STATE/services.list" ] || select_services_interactive || return 1
+    DEEP_DIAGNOSTICS=1
+    rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
+    backup_create; stop_engine_services || die 'failed to stop installed services'
+    : > "$RUN/strategy-results"
+    if [ -z "$(cat "$STATE/blockcheck.domain" 2>/dev/null || true)" ]; then set_first_blockcheck_target || return 1; fi
+    ENABLE_TCPDUMP=1
+    # Extended diagnostics are the only mode allowed to create Cxxxx evidence IDs.
+    # Normal modes always use Sxxxx IDs.
+    for e in $(engines_to_test); do
+        db="$BLOCKDIR/${e}.db"
+        rm -f "$db" "$BLOCKDIR/${e}.candidates"
+        run_engine_blockcheck "$e" C
+        run_rc=$?
+        if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
+            interrupted=1
+            break
+        fi
+        [ "$run_rc" -eq 0 ] || continue
+        [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
+    done
+    restore_all || { ROLLBACK_OK=0; }
+    finalize_report
+    DEEP_DIAGNOSTICS=0
+    [ "${interrupted:-0}" = 1 ] && return 130
+    t DEBUG_ONLY
+    say "Report: $REPORT_TXT"
+}
+
+cmd_restore() {
+    need_root; ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2
+    cleanup_ours
+    restart_engine_services || { say 'CRITICAL: could not restart services'; exit 2; }
+    t RESTORED
+}
+
+cmd_report() {
+    [ -f "$REPORT_TXT" ] && cat "$REPORT_TXT" || say "No report: $REPORT_TXT"
+}
+
+cmd_apply() {
+    ensure_default_files; need_root
+    file="$1"
+    [ -f "$file" ] || die "config file not found: $file"
+    detect_system; detect_zapret; detect_zapret2; backup_create
+    echo "ENGINE/strategy config:"; cat "$file"; echo
+    printf 'Apply this configuration? [y/N] '; read ans
+    case "$ans" in y|Y)
+      # Intentional: application is only supported for explicit raw command configs.
+      # This v1 writes the selected config to a clearly named staging file and does not rewrite vendor UCI automatically.
+      cp "$file" "$RUN/apply.conf"
+      say "Staged at $RUN/apply.conf. No vendor config was rewritten automatically."
+      ;; *) say 'Not applied.';; esac
+}
+
+cmd_custom() { ensure_default_files; add_custom; }
+
+
+package_manager_detect() {
+    if has apk; then
+        if [ -r /etc/openwrt_release ]; then PKG_MANAGER=apk-openwrt; else PKG_MANAGER=apk; fi
+    elif has opkg; then PKG_MANAGER=opkg
+    elif has apt-get; then PKG_MANAGER=apt
+    elif has dnf; then PKG_MANAGER=dnf
+    elif has yum; then PKG_MANAGER=yum
+    elif has pacman; then PKG_MANAGER=pacman
+    elif has zypper; then PKG_MANAGER=zypper
+    else PKG_MANAGER=none; PKG_MANAGER_VERSION=unavailable; return 0
+    fi
+    case "$PKG_MANAGER" in
+        apk-openwrt|apk) PKG_MANAGER_VERSION="$(apk --version 2>/dev/null | head -n1 || echo unavailable)";;
+        opkg) PKG_MANAGER_VERSION="$(opkg --version 2>/dev/null | head -n1 || echo unavailable)";;
+        apt) PKG_MANAGER_VERSION="$(apt-get --version 2>/dev/null | head -n1 || echo unavailable)";;
+        dnf) PKG_MANAGER_VERSION="$(dnf --version 2>/dev/null | head -n1 || echo unavailable)";;
+        yum) PKG_MANAGER_VERSION="$(yum --version 2>/dev/null | head -n1 || echo unavailable)";;
+        pacman) PKG_MANAGER_VERSION="$(pacman --version 2>/dev/null | head -n1 || echo unavailable)";;
+        zypper) PKG_MANAGER_VERSION="$(zypper --version 2>/dev/null | head -n1 || echo unavailable)";;
+    esac
+}
+
+package_name_for_manager() {
+    case "$1" in
+        apk-openwrt) awk -F'|' -v c="$2" '$1==c{print $2; exit}' "$REQ_FILE";;
+        opkg) awk -F'|' -v c="$2" '$1==c{print $3; exit}' "$REQ_FILE";;
+        apt) awk -F'|' -v c="$2" '$1==c{print $4; exit}' "$REQ_FILE";;
+        dnf|yum) awk -F'|' -v c="$2" '$1==c{print $5; exit}' "$REQ_FILE";;
+        pacman) awk -F'|' -v c="$2" '$1==c{print $6; exit}' "$REQ_FILE";;
+        zypper) awk -F'|' -v c="$2" '$1==c{print $7; exit}' "$REQ_FILE";;
+        apk) awk -F'|' -v c="$2" '$1==c{print $8; exit}' "$REQ_FILE";;
+    esac
+}
+
+package_installed() {
+    pkg="$1"
+    case "$PKG_MANAGER" in
+        apk-openwrt|apk) apk info -e "$pkg" >/dev/null 2>&1;;
+        opkg) opkg status "$pkg" 2>/dev/null | grep -q '^Status: install ok installed';;
+        apt) dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed';;
+        dnf|yum|zypper) rpm -q "$pkg" >/dev/null 2>&1;;
+        pacman) pacman -Q "$pkg" >/dev/null 2>&1;;
+        *) return 1;;
+    esac
+}
+
+requirements_status() {
+    say '============================================================'
+    say ' PACKAGE REQUIREMENTS'
+    say '============================================================'
+    package_manager_detect
+    say "Package manager : $PKG_MANAGER"
+    say "Manager version : $PKG_MANAGER_VERSION"
+    say "Requirements    : $REQ_FILE"
+    say '------------------------------------------------------------'
+    [ -f "$REQ_FILE" ] || { say '[ERROR] requirements.conf not installed'; return 1; }
+    printf '%-14s %-10s %-10s %-24s %s\n' 'COMMAND' 'MODE' 'STATUS' 'PACKAGE' 'PURPOSE'
+    while IFS='|' read -r cmd apk_pkg opkg_pkg apt_pkg dnf_pkg pacman_pkg zypper_pkg alpine_pkg mode purpose; do
+        case "$cmd" in ''|\#*) continue;; esac
+        pkg="$(package_name_for_manager "$PKG_MANAGER" "$cmd")"
+        [ -n "$pkg" ] || pkg='N/A'
+        if has "$cmd"; then cmd_status=OK; else cmd_status=MISSING; fi
+        if [ "$PKG_MANAGER" != none ] && [ "$pkg" != N/A ] && package_installed "$pkg"; then pkg_status=INSTALLED; else pkg_status=NOT_INSTALLED; fi
+        printf '%-14s %-10s %-10s %-24s %s\n' "$cmd" "$mode" "$cmd_status/$pkg_status" "$pkg" "$purpose"
+    done < "$REQ_FILE"
+    say '------------------------------------------------------------'
+    case "$PKG_MANAGER" in
+        apk-openwrt|apk) say "$(t INSTALLED_LIST)apk info -vv";;
+        opkg) say "$(t INSTALLED_LIST)opkg list-installed";;
+        apt) say "$(t INSTALLED_LIST)dpkg-query";;
+        dnf|yum|zypper) say "$(t INSTALLED_LIST)rpm -qa";;
+        pacman) say "$(t INSTALLED_LIST)pacman -Q";;
+        *) say "$(t PKG_MANAGER_NONE)";;
+    esac
+}
+
+
+usage() {
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+cat <<EOF2
+$NAME $VERSION ($RELEASE_DATE)
+
+Запуск без аргументов открывает интерактивное меню.
+CLI-режим также доступен:
+
+$NAME <command>
+
+Команды:
+  requirements показать состояние package manager и команд/пакетов
+  detect       определить систему, firewall, zapret/zapret2 и возможности curl
+  services     показать базу сервисов
+  baseline     выбрать сервисы и выполнить базовую проверку
+  blockcheck   запустить доступные blockcheck для автоматически выбранного target
+  blockcheck1  запустить только blockcheck.sh
+  blockcheck2  запустить только blockcheck2.sh
+  quick        baseline -> quick blockcheck -> проверка стратегий -> restore -> отчёт
+  full         baseline -> full blockcheck -> проверка стратегий -> restore -> отчёт
+  auto         baseline -> standard blockcheck для найденных движков -> анализ кандидатов -> restore -> отчёт
+  debug        только 77 -> [5]: глубокая диагностика Cxxxx с дополнительными артефактами
+  restore      удалить тестовые остатки и восстановить сервисы zapret
+  report       показать последний текстовый отчёт
+  apply FILE   подготовить лучший конфиг после ручной проверки
+  custom       добавить пользовательский сервис
+  external     открыть меню диагностики доступности/сети
+  stop         остановить текущий тест zapret-test
+
+Файлы:
+  /etc/zapret-test/config
+  /etc/zapret-test/services.conf
+  /etc/zapret-test/custom-services.conf
+  /etc/zapret-test/control.list
+
+Результаты:
+  /tmp/rezult_zapret.txt
+  /tmp/rezult_zapret.json
+  /tmp/zapret-best.conf
+  /tmp/zapret2-best.conf
+EOF2
+    else
+cat <<EOF2
+$NAME $VERSION ($RELEASE_DATE)
+
+Running without arguments opens the interactive menu.
+CLI mode is also available:
+
+$NAME <command>
+
+Commands:
+  requirements show package manager and command/package status
+  detect       detect system, firewall, zapret/zapret2 and curl capabilities
+  services     list service database
+  baseline     select services and run the baseline check
+  blockcheck   run available blockcheck tools for the selected target
+  blockcheck1  run zapret/blockcheck.sh only
+  blockcheck2  run zapret2/blockcheck2.sh only
+  quick        baseline -> quick blockcheck -> strategy verification -> restore -> report
+  full         baseline -> full blockcheck -> strategy verification -> restore -> report
+  auto         baseline -> standard blockcheck for detected engines -> candidate analysis -> restore -> report
+  debug        only via 77 -> [5]: deep Cxxxx diagnostics with additional evidence
+  restore      remove test leftovers and restore installed zapret services
+  report       print the latest text report
+  apply FILE   stage a reviewed best configuration
+  custom       add a custom service
+  external     open the availability/network diagnostics menu
+  stop         stop the currently running zapret-test operation
+
+Files:
+  /etc/zapret-test/config
+  /etc/zapret-test/services.conf
+  /etc/zapret-test/custom-services.conf
+  /etc/zapret-test/control.list
+
+Results:
+  /tmp/rezult_zapret.txt
+  /tmp/rezult_zapret.json
+  /tmp/zapret-best.conf
+  /tmp/zapret2-best.conf
+EOF2
+    fi
+}
+
+main() {
+    need_root
+    init_dirs
+    ensure_default_files
+    load_config
+    if [ "$#" -eq 0 ]; then
+        printf '%s\n' "$$" > "$RUN/active.main.pid"
+        interactive_menu
+        rm -f "$RUN/active.main.pid"
+        return $?
+    fi
+    C="$1"
+    case "$C" in version|--version|help|--help|-h|stop) ;; *) sync_domain_lists ;; esac
+    if [ "$C" != stop ] && [ "$C" != version ] && [ "$C" != --version ] && [ "$C" != help ] && [ "$C" != --help ] && [ "$C" != -h ]; then
+        printf '%s\n' "$$" > "$RUN/active.main.pid"
+    fi
+    case "$C" in
+      requirements) requirements_status;;
+      detect) cmd_detect=1; show_detect;;
+      services) cmd_services;;
+      baseline) cmd_baseline;;
+      blockcheck) cmd_blockcheck;;
+      blockcheck1) cmd_blockcheck1;;
+      blockcheck2) cmd_blockcheck2;;
+      quick) cmd_quick;;
+      full) cmd_full;;
+      auto) cmd_auto;;
+      debug) cmd_debug;;
+      restore) cmd_restore;;
+      report) cmd_report;;
+      apply) shift; [ $# -eq 1 ] || die 'apply needs FILE'; cmd_apply "$1";;
+      custom) cmd_custom;;
+      external) cmd_external;;
+      stop) stop_active_test;;
+      version|--version) printf "%s %s\n" "$NAME" "$VERSION";;
+      help|--help|-h) usage;;
+      *) die "unknown command: $C";;
+    esac
+}
+
+# runtime paths for binaries
+CURL="$(command -v curl 2>/dev/null || true)"; [ -n "$CURL" ] || CURL=/usr/bin/curl
+OPENSSL="$(command -v openssl 2>/dev/null || true)"; [ -n "$OPENSSL" ] || OPENSSL=/usr/bin/openssl
+USER_AGENT="${USER_AGENT:-Mozilla/5.0}"
+main "$@"

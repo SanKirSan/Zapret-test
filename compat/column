@@ -1,0 +1,33 @@
+#!/bin/sh
+# Minimal POSIX-compatible replacement for: column -t -s '	'
+# Used only to format upstream Censorcheck output on OpenWrt where util-linux column is absent.
+sep=' '
+table=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t) table=1; shift;;
+        -s) sep="${2:-}"; shift 2;;
+        --separator=*) sep="${1#*=}"; shift;;
+        -s*) sep="${1#-s}"; shift;;
+        -*) shift;;
+        *) shift;;
+    esac
+done
+# Censorcheck uses a tab separator. Fall back to tab if an empty separator is supplied.
+[ -n "$sep" ] || sep="$(printf '\t')"
+awk -v FS="$sep" '
+{
+  for (i=1;i<=NF;i++) { if (length($i)>w[i]) w[i]=length($i); a[NR,i]=$i }
+  nf[NR]=NF
+}
+END {
+  for (r=1;r<=NR;r++) {
+    line=""
+    for (i=1;i<=nf[r];i++) {
+      if (i>1) line=line "  "
+      line=line sprintf("%-*s", w[i], a[r,i])
+    }
+    sub(/[[:space:]]+$/, "", line)
+    print line
+  }
+}'

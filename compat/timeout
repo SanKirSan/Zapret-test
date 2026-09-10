@@ -1,0 +1,40 @@
+#!/bin/sh
+# POSIX timeout compatibility helper for OpenWrt BusyBox builds without timeout applet.
+# Supported form: timeout SECONDS COMMAND [ARGUMENTS...]
+limit="$1"
+shift
+case "$limit" in
+    ''|*[!0-9]*) exit 125 ;;
+esac
+[ "$limit" -gt 0 ] || exec "$@"
+
+"$@" &
+child="$!"
+start="$(date +%s 2>/dev/null || echo 0)"
+
+kill_tree() {
+    p="$1"
+    [ -d "/proc/$p" ] || return 0
+    children="$(cat "/proc/$p/task/$p/children" 2>/dev/null || true)"
+    for c in $children; do kill_tree "$c"; done
+    kill -TERM "$p" 2>/dev/null || true
+}
+
+while :; do
+    state="$(ps -o stat= -p "$child" 2>/dev/null | tr -d ' ')"
+    [ -n "$state" ] || break
+    case "$state" in Z*) break;; esac
+    now="$(date +%s 2>/dev/null || echo "$start")"
+    elapsed=$((now-start))
+    if [ "$elapsed" -ge "$limit" ]; then
+        kill_tree "$child"
+        sleep 1
+        kill -KILL "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+        exit 124
+    fi
+    sleep 1
+done
+
+wait "$child"
+exit $?
