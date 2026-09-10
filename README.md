@@ -34,8 +34,6 @@ wget -O - https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap
 curl -fsSL https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh | sh
 ```
 
-Вместо `OWNER/REPOSITORY` укажите фактический GitHub-путь проекта. `bootstrap.sh` скачивает исходный tar.gz-архив и запускает обычный `install.sh`; на OpenWrt это не требует `unzip`.
-
 `zapret-test` — консольный диагностический стенд для OpenWrt/Linux, предназначенный для проверки доступности сервисов, DNS, HTTP/HTTPS, blockcheck/blockcheck2 и кандидатов стратегий `zapret`/`zapret2`.
 
 Программа **не изменяет конфигурацию запущенного zapret/zapret2 без явного действия пользователя**. На время экспериментальных проверок она создаёт изолированное тестовое состояние, а после завершения выполняет rollback.
