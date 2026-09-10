@@ -39,3 +39,12 @@ SRC_DIR=$(find "$TMP_ROOT/src" -mindepth 1 -maxdepth 1 -type d -print | head -n1
 [ -n "$SRC_DIR" ] || { echo 'ERROR: source archive has no source directory.' >&2; exit 4; }
 chmod +x "$SRC_DIR/install.sh"
 exec "$SRC_DIR/install.sh"
+
+printf '\n'
+printf '%s\n' '============================================================'
+printf '%s\n' "                     ZAPRET-TEST $VERSION"
+printf '%s\n' '============================================================'
+printf '\n'
+printf '%s' 'Введите для начала работы с программой zapret-test: '
+read _
+printf '\n'
