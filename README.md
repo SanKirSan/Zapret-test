@@ -298,7 +298,6 @@ zapret-test/
 
 ### Источники доменных списков
 
-Основной внешний источник для расширенных service lists — `itdoginfo/allow-domains`. Сам репозиторий описывает форматы списков и публикует RAW-версии по сервисам и категориям. citeturn954269view1
 
 ---
 
@@ -535,7 +534,3 @@ zapret-test/
 An HTTP 3xx/403 response is not, by itself, proof of blocking or full application functionality. Successful DNS/TCP/TLS checks also do not prove that an entire application workflow works.
 
 Blockcheck candidates are experimental evidence. Unknown strategies must not be treated as working solely because an external command returned successfully.
-
-### Upstream list source
-
-`itdoginfo/allow-domains` is the primary external source for expanded service lists. It documents list formats and publishes RAW lists grouped by service and category. See the [itdoginfo/allow-domains repository](https://github.com/itdoginfo/allow-domains).
