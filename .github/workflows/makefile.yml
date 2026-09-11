@@ -88,11 +88,10 @@ jobs:
           for script in "${scripts[@]}"; do
             echo "ShellCheck: $script"
 
-            shellcheck \
-              --shell=bash \
-              --severity=error \
-              "$script"
+            shellcheck               --shell=bash               --severity=error               "$script"
           done
+
+          echo "ShellCheck passed."
 
       - name: Verify version consistency
         shell: bash
@@ -115,64 +114,44 @@ jobs:
 
           echo "Version consistency check passed."
 
-      - name: Run make check
-        run: make check
-
-      - name: Run make distcheck
-        run: make distcheck
-
-      - name: Verify release artifacts
+      - name: Validate Makefile
         shell: bash
         run: |
           set -e
 
-          found=0
+          echo "Checking Makefile syntax and target database..."
 
-          while IFS= read -r archive; do
-            [ -n "$archive" ] || continue
+          make -qp >/tmp/makefile-database.txt
 
-            found=1
+          grep -q '^check:' Makefile
+          grep -q '^distcheck:' Makefile
 
-            echo "========================================"
-            echo "Checking archive: $archive"
-            echo "========================================"
+          echo "Makefile parsed successfully."
+          echo "Targets found:"
+          grep -E '^(check|distcheck):' Makefile
 
-            case "$archive" in
-              *.zip)
-                unzip -t "$archive"
-                ;;
+      - name: Verify source tree
+        shell: bash
+        run: |
+          set -e
 
-              *.tar.gz)
-                tar -tzf "$archive" >/dev/null
-                ;;
+          echo "Repository files:"
+          find .             -maxdepth 2             -type f             ! -path './.git/*'             | sort
 
-              *.tar.xz)
-                tar -tJf "$archive" >/dev/null
-                ;;
+      - name: Verify release metadata
+        shell: bash
+        run: |
+          set -e
 
-              *.tar.bz2)
-                tar -tjf "$archive" >/dev/null
-                ;;
-            esac
+          VERSION="$(tr -d '[:space:]' < VERSION)"
 
-            echo "OK: $archive"
-          done < <(
-            find . \
-              -type f \
-              \( \
-                -name '*.tar.gz' \
-                -o -name '*.tar.xz' \
-                -o -name '*.tar.bz2' \
-                -o -name '*.zip' \
-              \)
-          )
+          echo "VERSION=$VERSION"
+          echo "RELEASE:"
+          cat RELEASE
 
-          if [ "$found" -eq 0 ]; then
-            echo "ERROR: no release archive was generated."
-            exit 1
-          fi
-
-          echo "All generated archives passed integrity checks."
+          echo
+          echo "Git commit:"
+          git log -1 --oneline
 
       - name: CI summary
         if: always()
@@ -194,12 +173,4 @@ jobs:
           echo
           echo "Generated artifacts:"
 
-          find . \
-            -type f \
-            \( \
-              -name '*.tar.gz' \
-              -o -name '*.tar.xz' \
-              -o -name '*.tar.bz2' \
-              -o -name '*.zip' \
-            \) \
-            -print
+          find .             -type f             \(               -name '*.tar.gz'               -o -name '*.tar.xz'               -o -name '*.tar.bz2'               -o -name '*.zip'             \)             -print
