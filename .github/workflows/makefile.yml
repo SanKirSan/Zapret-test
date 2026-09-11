@@ -1,4 +1,4 @@
-name: Makefile CI
+name: Build and test
 
 on:
   push:
@@ -21,17 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure
-        run: ./configure
-
-      - name: Install build dependencies
-        run: make
-
       - name: Check required files
+        shell: bash
         run: |
           set -e
 
-          required_files="
+          required_files=(
             VERSION
             RELEASE
             Makefile
@@ -44,9 +39,9 @@ jobs:
             requirements.conf
             services.conf
             domain-sources.conf
-          "
+          )
 
-          for file in $required_files; do
+          for file in "${required_files[@]}"; do
             if [ ! -f "$file" ]; then
               echo "ERROR: required file is missing: $file"
               exit 1
@@ -56,19 +51,20 @@ jobs:
           echo "All required files are present."
 
       - name: Shell syntax check
+        shell: bash
         run: |
           set -e
 
-          scripts="
+          scripts=(
             zapret-test
             install.sh
             bootstrap.sh
             build.sh
             control.sh
-          "
+          )
 
-          for script in $scripts; do
-            echo "Checking: $script"
+          for script in "${scripts[@]}"; do
+            echo "Checking syntax: $script"
             bash -n "$script"
           done
 
@@ -80,18 +76,19 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: ShellCheck
+        shell: bash
         run: |
           set -e
 
-          scripts="
+          scripts=(
             zapret-test
             install.sh
             bootstrap.sh
             build.sh
             control.sh
-          "
+          )
 
-          for script in $scripts; do
+          for script in "${scripts[@]}"; do
             echo "ShellCheck: $script"
             shellcheck \
               --shell=bash \
@@ -100,6 +97,7 @@ jobs:
           done
 
       - name: Verify version consistency
+        shell: bash
         run: |
           set -e
 
@@ -126,21 +124,6 @@ jobs:
         run: make distcheck
 
       - name: Verify release artifacts
-        run: |
-          set -e
-
-          echo "Release artifacts:"
-          find . \
-            -type f \
-            \( \
-              -name '*.tar.gz' \
-              -o -name '*.tar.xz' \
-              -o -name '*.tar.bz2' \
-              -o -name '*.zip' \
-            \) \
-            -print
-
-      - name: Verify generated archives
         shell: bash
         run: |
           set -e
@@ -149,6 +132,7 @@ jobs:
 
           while IFS= read -r archive; do
             [ -n "$archive" ] || continue
+
             found=1
 
             echo "========================================"
@@ -159,15 +143,12 @@ jobs:
               *.zip)
                 unzip -t "$archive"
                 ;;
-
               *.tar.gz)
                 tar -tzf "$archive" >/dev/null
                 ;;
-
               *.tar.xz)
                 tar -tJf "$archive" >/dev/null
                 ;;
-
               *.tar.bz2)
                 tar -tjf "$archive" >/dev/null
                 ;;
@@ -192,8 +173,9 @@ jobs:
 
           echo "All generated archives passed integrity checks."
 
-      - name: Print build summary
+      - name: CI summary
         if: always()
+        shell: bash
         run: |
           echo "========================================"
           echo "          ZAPRET-TEST CI SUMMARY"
@@ -205,13 +187,8 @@ jobs:
             echo "Version : unknown"
           fi
 
-          echo "Runner  : $RUNNER_OS"
           echo "Commit  : $GITHUB_SHA"
           echo "Branch  : $GITHUB_REF_NAME"
-
-          echo
-          echo "Git status:"
-          git status --short
 
           echo
           echo "Generated artifacts:"
