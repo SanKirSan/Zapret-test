@@ -1,0 +1,226 @@
+name: Makefile CI
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: ./configure
+
+      - name: Install build dependencies
+        run: make
+
+      - name: Check required files
+        run: |
+          set -e
+
+          required_files="
+            VERSION
+            RELEASE
+            Makefile
+            zapret-test
+            install.sh
+            bootstrap.sh
+            build.sh
+            control.sh
+            config
+            requirements.conf
+            services.conf
+            domain-sources.conf
+          "
+
+          for file in $required_files; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: required file is missing: $file"
+              exit 1
+            fi
+          done
+
+          echo "All required files are present."
+
+      - name: Shell syntax check
+        run: |
+          set -e
+
+          scripts="
+            zapret-test
+            install.sh
+            bootstrap.sh
+            build.sh
+            control.sh
+          "
+
+          for script in $scripts; do
+            echo "Checking: $script"
+            bash -n "$script"
+          done
+
+          echo "Shell syntax check passed."
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: ShellCheck
+        run: |
+          set -e
+
+          scripts="
+            zapret-test
+            install.sh
+            bootstrap.sh
+            build.sh
+            control.sh
+          "
+
+          for script in $scripts; do
+            echo "ShellCheck: $script"
+            shellcheck \
+              --shell=bash \
+              --severity=error \
+              "$script"
+          done
+
+      - name: Verify version consistency
+        run: |
+          set -e
+
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: VERSION is empty"
+            exit 1
+          fi
+
+          echo "Expected version: $VERSION"
+
+          grep -F "$VERSION" RELEASE
+          grep -F "$VERSION" README.md
+          grep -F "$VERSION" CHANGELOG.md
+          grep -F "$VERSION" zapret-test
+
+          echo "Version consistency check passed."
+
+      - name: Run make check
+        run: make check
+
+      - name: Run make distcheck
+        run: make distcheck
+
+      - name: Verify release artifacts
+        run: |
+          set -e
+
+          echo "Release artifacts:"
+          find . \
+            -type f \
+            \( \
+              -name '*.tar.gz' \
+              -o -name '*.tar.xz' \
+              -o -name '*.tar.bz2' \
+              -o -name '*.zip' \
+            \) \
+            -print
+
+      - name: Verify generated archives
+        shell: bash
+        run: |
+          set -e
+
+          found=0
+
+          while IFS= read -r archive; do
+            [ -n "$archive" ] || continue
+            found=1
+
+            echo "========================================"
+            echo "Checking archive: $archive"
+            echo "========================================"
+
+            case "$archive" in
+              *.zip)
+                unzip -t "$archive"
+                ;;
+
+              *.tar.gz)
+                tar -tzf "$archive" >/dev/null
+                ;;
+
+              *.tar.xz)
+                tar -tJf "$archive" >/dev/null
+                ;;
+
+              *.tar.bz2)
+                tar -tjf "$archive" >/dev/null
+                ;;
+            esac
+
+            echo "OK: $archive"
+          done < <(
+            find . \
+              -type f \
+              \( \
+                -name '*.tar.gz' \
+                -o -name '*.tar.xz' \
+                -o -name '*.tar.bz2' \
+                -o -name '*.zip' \
+              \)
+          )
+
+          if [ "$found" -eq 0 ]; then
+            echo "ERROR: no release archive was generated."
+            exit 1
+          fi
+
+          echo "All generated archives passed integrity checks."
+
+      - name: Print build summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "          ZAPRET-TEST CI SUMMARY"
+          echo "========================================"
+
+          if [ -f VERSION ]; then
+            echo "Version : $(tr -d '[:space:]' < VERSION)"
+          else
+            echo "Version : unknown"
+          fi
+
+          echo "Runner  : $RUNNER_OS"
+          echo "Commit  : $GITHUB_SHA"
+          echo "Branch  : $GITHUB_REF_NAME"
+
+          echo
+          echo "Git status:"
+          git status --short
+
+          echo
+          echo "Generated artifacts:"
+          find . \
+            -type f \
+            \( \
+              -name '*.tar.gz' \
+              -o -name '*.tar.xz' \
+              -o -name '*.tar.bz2' \
+              -o -name '*.zip' \
+            \) \
+            -print
