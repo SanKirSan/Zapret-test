@@ -1,8 +1,8 @@
-# zapret-test 0.6.6.6
+# zapret-test 0.6.7.1
 
-# Версия 0.6.6.6
+# Версия 0.6.7.1
 
-В версии 0.6.6.6 исправлены:
+В версии 0.6.6.9 исправлены: обновление доменных списков стало атомарным и авторитетным для соответствующего сервиса (без добавления устаревших bundled-доменов), добавлен fallback curl/wget → jsDelivr, отображается время последнего успешного обновления кэша, `ncat` имеет безусловный приоритет над `nc`, проверка кандидатов полностью блокируется после прерванного blockcheck, а приглашение к началу работы перенесено из installer в основной `zapret-test`.
 - после `Ctrl-C` прерванный `blockcheck` больше не создаёт и не запускает `Sxxxx`-проверки на неполных данных;
 - `ncat` имеет приоритет над `nc` для TCP-проверок, как требует upstream `zapret2`; BusyBox `nc` не используется;
 - автоматическое обновление списков теперь явно показывает, был ли список реально обновлён или остался без изменений, а для каждого успешного обновления сохраняется checksum/time metadata;
@@ -40,11 +40,16 @@ curl -fsSL https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstra
 
 ### Основные возможности
 
-В версии 0.6.6.6 исправлены: передача `Ctrl-C` в цепочке quick/full/automatic (частичный blockcheck больше не запускает проверку кандидатов), проверка стратегий через реальный IP с каскадом независимых DoH при синтетическом DNS, версия installer из единого `VERSION`, обязательный `ncat` для OpenWrt blockcheck2 и защита обновляемых списков доменов от повреждённого содержимого. Raw-вывод внешнего `blockcheck2.sh` сохраняется без локализации.
+В версии 0.6.7.1 исправлены: автоматическое сохранение raw-отчётов blockcheck, сохранение AVAILABLE-кандидатов при прерывании и очистка известных BusyBox arithmetic-ошибок из консольного вывода; в прямой диагностике blockcheck убран лишний предварительный экран «ВЫБОР ПРОФИЛЯ».
+
+В версии 0.6.6.9 исправлены: передача `Ctrl-C` в цепочке quick/full/automatic (частичный blockcheck больше не запускает проверку кандидатов), проверка стратегий через реальный IP с каскадом независимых DoH при синтетическом DNS, версия installer из единого `VERSION`, обязательный `ncat` для OpenWrt blockcheck2 и всех TCP-проверок, атомарное авторитетное обновление доменных списков без примеси устаревших bundled-доменов, fallback `curl/wget` → jsDelivr для raw GitHub-источников, отображение времени последнего успешного обновления cache, перенос приветствия с installer в основной `zapret-test`, произвольный выбор target домена после базовой TCP-проверки и сохранение подтверждённых рабочих стратегий для последующего теста совместимости. Raw-вывод внешнего `blockcheck2.sh` сохраняется без локализации.
 
 - быстрый, полный и автоматический режимы тестирования;
 - отдельный baseline без запуска blockcheck;
 - blockcheck и blockcheck2 с live-выводом и корректным `Ctrl-C`;
+- после выбора сервиса выполняется TCP baseline по валидным доменам, затем target можно выбрать вручную из полного списка или оставить автоматический первый домен;
+- подтверждённые `PASS`-стратегии без side effects и без untested endpoints сохраняются в `/tmp/zapret-test/working-strategies/`;
+- в меню `Диагностика blockcheck` добавлен режим `4) Совместимость стратегий`: стратегии запускаются автоматически на всех или выбранных доменах другого/исходного сервиса без ручного выбора каждой стратегии;
 - расширенная диагностика стратегий только через `77 → Расширенная диагностика`;
 - DNS integrity с локальным DNS, настроенными upstream-resolver'ами, DoH cross-check и отдельной проверкой TLS/DoT transport;
 - native availability/network diagnostics для OpenWrt;
@@ -72,7 +77,7 @@ https://raw.githubusercontent.com/itdoginfo/allow-domains/refs/heads/main/Servic
 
 Например, список YouTube включает дополнительные служебные и медиадомены; аналогично расширены Discord, Telegram, Meta и TikTok.
 
-Загруженный список проверяется перед заменой кэша. При недоступности GitHub используется последняя сохранённая копия. При отсутствии и сети, и кэша остаётся встроенный список.
+Загруженный список проходит проверку доменов и обязательных sentinel-значений до атомарной замены кэша. Успешный источник полностью заменяет домены соответствующего сервиса; устаревшие bundled-домены к нему не добавляются. Для `raw.githubusercontent.com` при недоступности основного источника используется jsDelivr. При недоступности источников используется последняя валидная копия с отображением времени последнего успешного обновления. При отсутствии и сети, и валидного кэша остаётся встроенный список.
 
 Отключение автообновления:
 
@@ -208,7 +213,7 @@ zypper        openSUSE / SUSE
 ```sh
 cd /tmp
 rm -rf /tmp/zapret-test
-unzip -q zapret-test-0.6.6.6.zip
+unzip -q zapret-test-0.6.7.1.zip
 cd /tmp/zapret-test
 chmod +x install.sh
 ./install.sh
@@ -260,7 +265,7 @@ make package
 
 ```sh
 make check
-sha256sum zapret-test-0.6.6.6.zip
+sha256sum zapret-test-0.6.6.9.zip
 ```
 
 Подробные инструкции находятся в `BUILD.md`.
@@ -309,19 +314,19 @@ zapret-test/
 For Bash/Zsh:
 
 ```sh
-sh <(wget -O - https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh)
+sh <(wget -O - https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh)
 ```
 
 For OpenWrt/BusyBox `ash`, use the POSIX pipe form:
 
 ```sh
-wget -O - https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh | sh
+wget -O - https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh | sh
 ```
 
 The `curl` equivalent is:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPOSITORY/main/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SanKirSan/Zapret-test/main/bootstrap.sh | sh
 ```
 
 `zapret-test` is a CLI diagnostic harness for OpenWrt/Linux. It tests service reachability, DNS, HTTP/HTTPS, blockcheck/blockcheck2 and candidate `zapret`/`zapret2` strategies.
@@ -446,7 +451,7 @@ Package-name mappings are stored in `requirements.conf` because the same command
 ```sh
 cd /tmp
 rm -rf /tmp/zapret-test
-unzip -q zapret-test-0.6.6.6.zip
+unzip -q zapret-test-0.6.6.9.zip
 cd /tmp/zapret-test
 chmod +x install.sh
 ./install.sh
@@ -498,7 +503,7 @@ For CI:
 
 ```sh
 make check
-sha256sum zapret-test-0.6.6.6.zip
+sha256sum zapret-test-0.6.6.9.zip
 ```
 
 See `BUILD.md` for detailed build instructions.

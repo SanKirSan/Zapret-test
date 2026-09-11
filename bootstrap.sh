@@ -2,11 +2,10 @@
 set -eu
 
 # zapret-test GitHub bootstrap installer.
-# Replace these defaults before publishing the repository. They may also be overridden
+# The repository defaults may be overridden
 # with ZAPRET_TEST_REPO and ZAPRET_TEST_REF environment variables.
 REPO="${ZAPRET_TEST_REPO:-SanKirSan/Zapret-test}"
 REF="${ZAPRET_TEST_REF:-main}"
-BASE="https://raw.githubusercontent.com/$REPO/$REF"
 ARCHIVE_URL="${ZAPRET_TEST_ARCHIVE_URL:-https://github.com/$REPO/archive/refs/heads/$REF.tar.gz}"
 
 TMP_ROOT="${TMPDIR:-/tmp}/zapret-test-bootstrap.$$"

@@ -1,5 +1,5 @@
 NAME ?= zapret-test
-VERSION ?= 0.6.6.6
+VERSION ?= 0.6.7.1
 DIST := $(NAME)-$(VERSION).zip
 PREFIX_ROOT ?=
 PREFIX_RUN ?=

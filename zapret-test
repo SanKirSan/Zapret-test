@@ -5,8 +5,8 @@
 set -u
 
 NAME="zapret-test"
-VERSION="0.6.6.6"
-RELEASE_DATE="2026-09-10"
+VERSION="0.6.7.1"
+RELEASE_DATE="2026-09-11"
 ETC="${ZAPRET_TEST_ETC:-/etc/zapret-test}"
 RUN="${ZAPRET_TEST_RUN:-/tmp/zapret-test}"
 BACKUP="$RUN/backup"
@@ -29,6 +29,9 @@ BUNDLED="$ETC/bundled"
 COMPATDIR="$ETC/compat"
 REQ_FILE="$ETC/requirements.conf"
 REQ_STATE_DIR="$RUN/requirements"
+WORKING_STRATEGY_DIR="$RUN/working-strategies"
+COMPAT_TARGETS_FILE=""
+COMPAT_ATTEMPTS="${COMPAT_ATTEMPTS:-3}"
 STATE="$RUN/state"
 PIDFILE="$RUN/pid"
 QNUM="$(( $$ % 64536 + 1000 ))"
@@ -57,6 +60,7 @@ TIMEOUT="${TIMEOUT:-10}"
 BLOCKCHECK_CURL_MAX_TIME="${BLOCKCHECK_CURL_MAX_TIME:-2}"
 BLOCKCHECK_CURL_MAX_TIME_QUIC="${BLOCKCHECK_CURL_MAX_TIME_QUIC:-$BLOCKCHECK_CURL_MAX_TIME}"
 BLOCKCHECK_TIMEOUT="${BLOCKCHECK_TIMEOUT:-0}"
+BLOCKCHECK_PORT_TIMEOUT="${BLOCKCHECK_PORT_TIMEOUT:-3}"
 WAIT_AFTER_RESTART="${WAIT_AFTER_RESTART:-3}"
 BLOCKCHECK_SCANLEVEL="${BLOCKCHECK_SCANLEVEL:-standard}"
 BLOCKCHECK_OUTPUT_MODE="${BLOCKCHECK_OUTPUT_MODE:-summary}" # summary|raw
@@ -65,6 +69,7 @@ ENABLE_UDP="${ENABLE_UDP:-1}"
 BLOCKCHECK_RUNNING_PID=""
 BLOCKCHECK_RUNNING_ENGINE=""
 BLOCKCHECK_RUNNING_LOG=""
+BLOCKCHECK_INTERRUPTED=0
 EXTERNAL_DIR="$RUN/external"
 EXTERNAL_RUNNING_PID=""
 EXTERNAL_RUNNING_LOG=""
@@ -77,6 +82,7 @@ EXTERNAL_RU_IPERF_URL="${EXTERNAL_RU_IPERF_URL:-https://github.com/itdoginfo/rus
 EXTERNAL_IPCHECKPLACE_URL="${EXTERNAL_IPCHECKPLACE_URL:-https://IP.Check.Place}"
 EXTERNAL_CHECKPLACE_URL="${EXTERNAL_CHECKPLACE_URL:-https://Check.Place}"
 LANG_MODE="${ZAPRET_TEST_LANG:-RU}"
+LIST_MIRROR_ENABLE="${LIST_MIRROR_ENABLE:-1}"
 
 umask 077
 if [ -d "$COMPATDIR" ]; then PATH="$COMPATDIR:$PATH"; export PATH; fi
@@ -137,6 +143,20 @@ t() {
         RU:BC1) echo 'Запустить blockcheck (zapret)' ;; EN:BC1) echo 'Run blockcheck (zapret)' ;;
         RU:BC2) echo 'Запустить blockcheck2 (zapret2)' ;; EN:BC2) echo 'Run blockcheck2 (zapret2)' ;;
         RU:BCBOTH) echo 'Запустить blockcheck + blockcheck2' ;; EN:BCBOTH) echo 'Run blockcheck + blockcheck2' ;;
+        RU:BC_COMPAT) echo 'Совместимость стратегий' ;; EN:BC_COMPAT) echo 'Strategy compatibility' ;;
+        RU:BC_COMPAT_ORIGINAL) echo 'Проверить исходный сервис стратегий' ;; EN:BC_COMPAT_ORIGINAL) echo 'Test original strategy service' ;;
+        RU:BC_COMPAT_OTHER) echo 'Проверить другой сервис' ;; EN:BC_COMPAT_OTHER) echo 'Test another service' ;;
+        RU:BC_COMPAT_TARGET_MODE) echo 'Область проверки доменов' ;; EN:BC_COMPAT_TARGET_MODE) echo 'Domain test scope' ;;
+        RU:BC_COMPAT_ALL) echo 'Все валидные домены' ;; EN:BC_COMPAT_ALL) echo 'All valid domains' ;;
+        RU:BC_COMPAT_SELECT) echo 'Один или несколько доменов' ;; EN:BC_COMPAT_SELECT) echo 'One or more domains' ;;
+        RU:BC_COMPAT_NONE) echo 'Нет сохранённых рабочих стратегий.' ;; EN:BC_COMPAT_NONE) echo 'No saved working strategies.' ;;
+        RU:BC_COMPAT_COUNT) printf '%s' 'Сохранено рабочих стратегий: ' ;; EN:BC_COMPAT_COUNT) printf '%s' 'Saved working strategies: ' ;;
+        RU:BC_COMPAT_RUNNING) echo 'Проверка совместимости сохранённых стратегий...' ;; EN:BC_COMPAT_RUNNING) echo 'Testing saved strategy compatibility...' ;;
+        RU:BC_TARGET_PROMPT) printf '%s' 'Target [Enter=авто, 1..N, 0=назад]: ' ;; EN:BC_TARGET_PROMPT) printf '%s' 'Target [Enter=auto, 1..N, 0=back]: ' ;;
+        RU:BC_TARGET_SELECTED) printf '%s' 'Выбранный target: ' ;; EN:BC_TARGET_SELECTED) printf '%s' 'Selected target: ' ;;
+        RU:BC_PORT_BASELINE) echo 'Базовая TCP-проверка доменов' ;; EN:BC_PORT_BASELINE) echo 'Baseline TCP port check' ;;
+        RU:BC_PORT_TARGETS) echo 'Можно выбрать любой домен независимо от результата базовой проверки.' ;; EN:BC_PORT_TARGETS) echo 'Any domain can be selected regardless of the baseline result.' ;;
+        RU:BC_COMPAT_RESULT) echo 'Результат совместимости' ;; EN:BC_COMPAT_RESULT) echo 'Compatibility result' ;;
         RU:AVAIL_MENU) echo 'Диагностика доступности / сети' ;; EN:AVAIL_MENU) echo 'Availability / network diagnostics' ;;
         RU:CUSTOM) echo 'Добавить свой сервис' ;; EN:CUSTOM) echo 'Add custom service' ;;
         RU:REQ) echo 'Зависимости пакетов' ;; EN:REQ) echo 'Package requirements' ;;
@@ -652,6 +672,7 @@ BLOCKCHECK_CURL_MAX_TIME=2
 BLOCKCHECK_CURL_MAX_TIME_QUIC=2
 STRATEGY_TIMEOUT=60
 BLOCKCHECK_TIMEOUT=0
+BLOCKCHECK_PORT_TIMEOUT=3
 WAIT_AFTER_RESTART=3
 MAX_COMBINATIONS=20
 ENABLE_UDP=1
@@ -851,6 +872,64 @@ translate_group_name() {
     fi
 }
 
+download_domain_source() {
+    url="$1"; out="$2"; ok=1
+    rm -f "$out"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 1 "$url" -o "$out" 2>/dev/null && ok=0
+    fi
+    if [ "$ok" -ne 0 ] && command -v wget >/dev/null 2>&1; then
+        wget -q -T 20 -O "$out" "$url" 2>/dev/null && ok=0
+    fi
+    if [ "$ok" -ne 0 ] && [ "${LIST_MIRROR_ENABLE:-1}" = 1 ]; then
+        mirror=""
+        case "$url" in
+            https://raw.githubusercontent.com/*/*/*)
+                rest="${url#https://raw.githubusercontent.com/}"
+                owner="${rest%%/*}"; rest="${rest#*/}"
+                repo="${rest%%/*}"; rest="${rest#*/}"
+                ref="${rest%%/*}"; path="${rest#*/}"
+                mirror="https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path}"
+                ;;
+        esac
+        if [ -n "$mirror" ]; then
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL --connect-timeout 8 --max-time 20 --retry 2 --retry-delay 1 "$mirror" -o "$out" 2>/dev/null && ok=0
+            fi
+            if [ "$ok" -ne 0 ] && command -v wget >/dev/null 2>&1; then
+                wget -q -T 20 -O "$out" "$mirror" 2>/dev/null && ok=0
+            fi
+        fi
+    fi
+    return "$ok"
+}
+
+valid_domain_file() {
+    file="$1"; required="$2"
+    [ -s "$file" ] || return 1
+    count="$(awk '$1 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/ {n++} END{print n+0}' "$file" 2>/dev/null)"
+    [ "$count" -ge 2 ] || return 1
+    oldifs="$IFS"; IFS=','
+    for sentinel in $required; do
+        needle="$(printf '%s' "$sentinel" | tr 'A-Z' 'a-z')"
+        grep -Fxq "$needle" "$file" 2>/dev/null || { IFS="$oldifs"; return 1; }
+    done
+    IFS="$oldifs"
+    return 0
+}
+
+runtime_set_service_domains() {
+    svc="$1"; domain_file="$2"
+    [ -s "$domain_file" ] || return 1
+    domains="$(tr 'A-Z' 'a-z' < "$domain_file" | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    [ -n "$domains" ] || return 1
+    awk -v svc="$svc" -v dom="$domains" '
+        /^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc)}
+        in_s && /^DOMAINS=/{print "DOMAINS=\"" dom "\""; in_s=0; next}
+        {print}
+    ' "$RUN/services-runtime.conf" > "$RUN/services-runtime.tmp" && mv "$RUN/services-runtime.tmp" "$RUN/services-runtime.conf"
+}
+
 sync_domain_lists() {
     ensure_default_files
     [ "${ENABLE_LIST_AUTOUPDATE:-1}" = 0 ] && { say "$(t LIST_DISABLED)"; SERVICE_DB="$SERVICES"; return 0; }
@@ -858,67 +937,60 @@ sync_domain_lists() {
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then SERVICE_DB="$SERVICES"; return 0; fi
     say "$(t LIST_UPDATE)"
     [ -f "$DOMAIN_SOURCES" ] || { SERVICE_DB="$SERVICES"; return 0; }
+
     while IFS='|' read -r svc url filter required; do
         case "$svc" in ''|\#*) continue;; esac
-        cache="$DOMAIN_LIST_DIR/${svc}.lst"; tmp="$RUN/lists/${svc}.tmp"; ok=0
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --connect-timeout 5 --max-time 8 "$url" -o "$tmp" 2>/dev/null && ok=1
-        fi
-        if [ "$ok" -ne 1 ] && command -v wget >/dev/null 2>&1; then
-            wget -q -T 8 -O "$tmp" "$url" && ok=1
-        fi
+        cache="$DOMAIN_LIST_DIR/${svc}.lst"
+        tmp="$RUN/lists/${svc}.tmp"
+        filtered="$RUN/lists/${svc}.filtered"
+        old_sha=""
+        [ -s "$cache" ] && old_sha="$(sha256sum "$cache" 2>/dev/null | awk '{print $1}')"
+
         source_valid=0
-        if [ "$ok" = 1 ]; then
-            normalized="$RUN/lists/${svc}.normalized"
-            awk 'NF && $1 !~ /^#/ && $1 !~ /^;/ {gsub(/^\*\./,"",$1); print tolower($1)}' "$tmp" | sort -u > "$normalized"
-            valid_count=$(awk '$1 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/ {n++} END{print n+0}' "$normalized" 2>/dev/null)
-            [ "$valid_count" -ge 2 ] && source_valid=1
-            oldifs="$IFS"; IFS=','
-            for sentinel in $required; do
-                needle="$(printf '%s' "$sentinel" | tr '[:upper:]' '[:lower:]')"
-                grep -Fxq "$needle" "$normalized" 2>/dev/null || { source_valid=0; break; }
-            done
-            IFS="$oldifs"
+        if download_domain_source "$url" "$tmp"; then
+            awk -v filter="$filter" 'NF && $1 !~ /^#/ && $1 !~ /^;/ {
+                gsub(/^\\*\./,"",$1); v=tolower($1)
+                valid=(v ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/)
+                if (valid && filter=="all") print v
+                else if (valid && filter=="instagram" && (v ~ /instagram/ || v=="ig.me" || v ~ /(^|\.)fbcdn\.net$/ || v ~ /(^|\.)fbsbx\.com$/)) print v
+            }' "$tmp" | sort -u > "$filtered"
+            if valid_domain_file "$filtered" "$required"; then source_valid=1; fi
         fi
+
         if [ "$source_valid" = 1 ]; then
-            old_sha=""
-            [ -s "$cache" ] && old_sha="$(sha256sum "$cache" 2>/dev/null | awk '{print $1}')"
-            awk -v filter="$filter" 'NF && $1 !~ /^#/ && $1 !~ /^;/ {gsub(/^\*\./,"",$1); v=tolower($1); valid=(v ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/); if (valid && filter=="all") print v; else if (valid && filter=="instagram" && (v ~ /instagram/ || v=="ig.me" || v ~ /(^|\.)fbcdn\.net$/ || v ~ /(^|\.)fbsbx\.com$/)) print v}' "$tmp" | sort -u > "$cache"
-            rm -f "$tmp" "$normalized"
-            cnt=$(wc -l < "$cache" 2>/dev/null | tr -d ' ')
+            mv "$filtered" "$cache"
+            rm -f "$tmp"
+            cnt="$(wc -l < "$cache" 2>/dev/null | tr -d ' ')"
             new_sha="$(sha256sum "$cache" 2>/dev/null | awk '{print $1}')"
             sync_time="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
-            printf '%s|%s|%s|%s\n' "$svc" "$sync_time" "$cnt" "$new_sha" > "$DOMAIN_LIST_DIR/${svc}.meta"
+            printf '%s|%s|%s|%s|source\n' "$svc" "$sync_time" "$cnt" "$new_sha" > "$DOMAIN_LIST_DIR/${svc}.meta"
             if [ -n "$old_sha" ] && [ "$old_sha" = "$new_sha" ]; then
-                [ "${LANG_MODE:-RU}" = RU ] && printf '  [OK] %s — %s доменов — без изменений\n' "$svc" "$cnt" || printf '  [OK] %s — %s domains — unchanged\n' "$svc" "$cnt"
+                [ "${LANG_MODE:-RU}" = RU ] && printf '  [OK] %s — %s доменов — без изменений (%s)\n' "$svc" "$cnt" "$sync_time" || printf '  [OK] %s — %s domains — unchanged (%s)\n' "$svc" "$cnt" "$sync_time"
             else
                 [ "${LANG_MODE:-RU}" = RU ] && printf '  [ОБНОВЛЕНО] %s — %s доменов — %s\n' "$svc" "$cnt" "$sync_time" || printf '  [UPDATED] %s — %s domains — %s\n' "$svc" "$cnt" "$sync_time"
             fi
-        elif [ -s "$cache" ]; then
-            cache_valid=1
-            cache_count=$(awk '$1 ~ /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/ {n++} END{print n+0}' "$cache" 2>/dev/null)
-            [ "$cache_count" -ge 2 ] || cache_valid=0
-            oldifs="$IFS"; IFS=','
-            for sentinel in $required; do needle="$(printf '%s' "$sentinel" | tr '[:upper:]' '[:lower:]')"; grep -Fxq "$needle" "$cache" 2>/dev/null || { cache_valid=0; break; }; done
-            IFS="$oldifs"
-            if [ "$cache_valid" = 1 ]; then
-                rm -f "$tmp"; cnt=$(wc -l < "$cache" 2>/dev/null | tr -d ' '); [ "${LANG_MODE:-RU}" = RU ] && printf '  [CACHE] %s — %s доменов\n' "$svc" "$cnt" || printf '  [CACHE] %s — %s domains\n' "$svc" "$cnt"
-            else
-                rm -f "$tmp" "$cache"; [ "${LANG_MODE:-RU}" = RU ] && printf '  [WARN] %s — повреждённый кэш удалён, используется встроенный список\n' "$svc" || printf '  [WARN] %s — invalid cache removed, using bundled list\n' "$svc"
-            fi
+        elif valid_domain_file "$cache" "$required"; then
+            rm -f "$tmp" "$filtered"
+            cnt="$(wc -l < "$cache" 2>/dev/null | tr -d ' ')"
+            last="$(awk -F'|' 'NR==1{print $2}' "$DOMAIN_LIST_DIR/${svc}.meta" 2>/dev/null || true)"
+            [ "${LANG_MODE:-RU}" = RU ] && printf '  [CACHE] %s — %s доменов — последнее обновление: %s\n' "$svc" "$cnt" "${last:-неизвестно}" || printf '  [CACHE] %s — %s domains — last update: %s\n' "$svc" "$cnt" "${last:-unknown}"
         else
-            rm -f "$tmp"; [ "${LANG_MODE:-RU}" = RU ] && printf '  [WARN] %s — список недоступен, используется встроенный список\n' "$svc" || printf '  [WARN] %s — source unavailable, using bundled list\n' "$svc"
+            rm -f "$tmp" "$filtered"
+            [ -s "$cache" ] && rm -f "$cache"
+            [ "${LANG_MODE:-RU}" = RU ] && printf '  [WARN] %s — источник недоступен и валидного кэша нет; используется встроенный список\n' "$svc" || printf '  [WARN] %s — source unavailable and no valid cache; using bundled list\n' "$svc"
         fi
     done < "$DOMAIN_SOURCES"
+
     cp "$SERVICES" "$RUN/services-runtime.conf"
     for svc in YouTube Discord Telegram Instagram TikTok; do
-        cache="$DOMAIN_LIST_DIR/${svc}.lst"; [ -s "$cache" ] || continue
-        old="$(awk -v svc="$svc" '/^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc); next} in_s && /^DOMAINS=/{x=$0; sub(/^DOMAINS=/,"",x); gsub(/^"|"$/,"",x); print x; exit}' "$SERVICES")"
-        merged="$(printf '%s\n' $old; cat "$cache")"; merged="$(printf '%s\n' "$merged" | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-        awk -v svc="$svc" -v dom="$merged" '/^SERVICE=/{cur=$0; sub(/^SERVICE=/,"",cur); gsub(/^"|"$/,"",cur); in_s=(cur==svc)} in_s && /^DOMAINS=/{print "DOMAINS=\"" dom "\""; in_s=0; next} {print}' "$RUN/services-runtime.conf" > "$RUN/services-runtime.tmp" && mv "$RUN/services-runtime.tmp" "$RUN/services-runtime.conf"
+        cache="$DOMAIN_LIST_DIR/${svc}.lst"
+        if valid_domain_file "$cache" ""; then
+            runtime_set_service_domains "$svc" "$cache" || true
+        fi
     done
     SERVICE_DB="$RUN/services-runtime.conf"
 }
+
 print_service_groups() {
     svc="$1"
     rec="$(service_record "$svc")"
@@ -987,7 +1059,7 @@ select_services_interactive() {
 
 discover_keyword_service() {
     keyword="$1"
-    keyword=$(printf '%s' "$keyword" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    keyword=$(printf '%s' "$keyword" | tr 'A-Z' 'a-z' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     case "$keyword" in
         ''|*[!a-z0-9._-]*) t INVALID; return 1 ;;
     esac
@@ -1007,7 +1079,7 @@ discover_keyword_service() {
             printf '%s' "$search_json" | jq -r '.[]?.name_value // empty' 2>/dev/null \
                 | tr '\r' '\n' \
                 | sed 's/^\*\.//; s/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' \
-                | tr '[:upper:]' '[:lower:]' \
+                | tr 'A-Z' 'a-z' \
                 | grep -E '(^|\.)[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$' \
                 | grep -F "$keyword" \
                 | sort -u >> "$domains_file" || true
@@ -1046,7 +1118,7 @@ valid_domain() {
 validate_domains() {
     _invalid=""
     for _vd in $1; do
-        _nd=$(printf '%s' "$_vd" | tr '[:upper:]' '[:lower:]')
+        _nd=$(printf '%s' "$_vd" | tr 'A-Z' 'a-z')
         if ! valid_domain "$_nd"; then
             _invalid="$_invalid $_vd"
         fi
@@ -1062,7 +1134,7 @@ validate_domains() {
 normalize_domains() {
     _out=""
     for _vd in $1; do
-        _nd=$(printf '%s' "$_vd" | tr '[:upper:]' '[:lower:]')
+        _nd=$(printf '%s' "$_vd" | tr 'A-Z' 'a-z')
         case " $_out " in
             *" $_nd "*) ;;
             *) _out="$_out $_nd";;
@@ -1175,6 +1247,13 @@ delete_custom_service() {
 
 manage_custom_services() {
     ensure_default_files
+    clear 2>/dev/null || true
+    say "============================================================"
+    say "                     ZAPRET-TEST $VERSION"
+    say "============================================================"
+    say ""
+    printf "%s" "Введите для начала работы с программой zapret-test [Enter]... "
+    read _start_confirm
     while :; do
         clear 2>/dev/null || true
         say '=============================================='
@@ -1282,11 +1361,68 @@ EOF2
     return 1
 }
 
+get_valid_service_domains() {
+    svc="$1"
+    rec="$(service_record "$svc")"
+    IFS='|' read -r _ _ domains _ _ _ _ _ groups <<EOF2
+$rec
+EOF2
+    primary="$(service_primary_domain "$svc" | head -n1)"
+    valid_list=""
+    [ -n "$primary" ] && valid_domain "$primary" && valid_list="$primary"
+    for d in $domains; do
+        valid_domain "$d" || continue
+        case " $valid_list " in *" $d "*) :;; *) valid_list="$valid_list $d";; esac
+    done
+    if [ -n "${groups:-}" ]; then
+        oldifs="$IFS"; IFS=';'
+        for grp in $groups; do
+            gdoms="${grp#*::}"
+            for d in $gdoms; do
+                valid_domain "$d" || continue
+                case " $valid_list " in *" $d "*) :;; *) valid_list="$valid_list $d";; esac
+            done
+        done
+        IFS="$oldifs"
+    fi
+    printf '%s\n' $valid_list
+}
+
+blockcheck_port_baseline() {
+    svc="$1"; valid_list="$2"
+    say ''
+    say "[$(t BC_PORT_BASELINE)] $svc"
+    rec="$(service_record "$svc")"
+    IFS='|' read -r _ _ _ tcp_ports _ _ _ _ <<EOF2
+$rec
+EOF2
+    [ -n "$tcp_ports" ] || tcp_ports='80 443'
+    pass=0; fail=0; unknown=0
+    for d in $valid_list; do
+        dnsr="$(dns_probe "$d" 2>/dev/null || true)"
+        ip=""
+        case "$dnsr" in
+            PASS\|*) ip="${dnsr#*|}";;
+            DNS_SYNTHETIC*|DNS_FAILURE*)
+                dr="$(dns_integrity_probe "$d" 2>/dev/null || true)"
+                ip="$(printf '%s' "$dr" | cut -d'|' -f4)"
+                ;;
+        esac
+        for port in $tcp_ports; do
+            state=UNAVAILABLE
+            [ -n "$ip" ] && ! is_synthetic_ip "$ip" && state="$(tcp_probe "$ip" "$port" "$BLOCKCHECK_PORT_TIMEOUT")"
+            case "$state" in
+                PASS) pass=$((pass+1)); say "[ПОРТ] port block tests ipv4 ${d}:${port} — Доступен.";;
+                TCP_FAILURE) fail=$((fail+1)); say "[ПОРТ] port block tests ipv4 ${d}:${port} — Недоступен.";;
+                *) unknown=$((unknown+1)); say "[ПОРТ] port block tests ipv4 ${d}:${port} — $(t PORT_UNKNOWN).";;
+            esac
+        done
+    done
+    say "  TCP: Доступен=$pass | Недоступен=$fail | $(t PORT_UNKNOWN)=$unknown"
+}
+
 select_blockcheck_target() {
     ensure_default_files
-    if [ ! -s "$STATE/services.list" ]; then
-        select_services_interactive || return 1
-    fi
     rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"
     clear 2>/dev/null || true
     say '=============================================='
@@ -1294,7 +1430,8 @@ select_blockcheck_target() {
     say '=============================================='
     t BLOCKCHECK_TARGET_INFO1
     t BLOCKCHECK_TARGET_INFO2
-    t BLOCKCHECK_TARGET_INFO3
+    say 'После выбора сервиса выполняется базовая TCP-проверка всего списка доменов.'
+    say 'После неё можно выбрать любой домен; результат доступности не ограничивает выбор target.'
     say ''
     parse_services > "$RUN/blockcheck-service-source"
     i=1; : > "$RUN/blockcheck-service-menu"
@@ -1310,29 +1447,30 @@ select_blockcheck_target() {
     svc=$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/blockcheck-service-menu")
     [ -n "$svc" ] || { say "$(t INVALID)"; return 1; }
     printf '%s\n' "$svc" > "$STATE/blockcheck.service"
-    rec="$(service_record "$svc")"
-    IFS='|' read -r _ _ domains _ _ _ _ _ groups <<EOF2
-$rec
-EOF2
-    primary="$(service_primary_domain "$svc" | head -n1)"
-    valid_list=''
-    [ -n "$primary" ] && valid_domain "$primary" && valid_list="$primary"
-    for d in $domains; do
-        valid_domain "$d" || continue
-        case " $valid_list " in *" $d "*) :;; *) valid_list="$valid_list $d";; esac
-    done
+    valid_list="$(get_valid_service_domains "$svc")"
     [ -n "$valid_list" ] || { t NO_VALID_BC_DOMAINS; return 1; }
     say ''
     say "TARGETS: $svc"
-    idx=0
+    idx=0; primary="$(service_primary_domain "$svc" | head -n1)"
     for d in $valid_list; do
         idx=$((idx+1))
-        if [ "$idx" -eq 1 ]; then printf '  [%02d] → %s\n' "$idx" "$d"; else printf '  [%02d]   %s\n' "$idx" "$d"; fi
+        if [ "$d" = "$primary" ]; then printf '  [%02d] → %s\n' "$idx" "$d"; else printf '  [%02d]   %s\n' "$idx" "$d"; fi
     done
-    target="$primary"
-    [ -n "$target" ] || target="$(printf '%s\n' $valid_list | head -n1)"
+    blockcheck_port_baseline "$svc" "$valid_list"
+    say ''
+    t BC_PORT_TARGETS
+    auto_target="$primary"
+    [ -n "$auto_target" ] || auto_target="$(printf '%s\n' $valid_list | head -n1)"
+    t BC_TARGET_PROMPT
+    read target_sel || target_sel=''
+    case "$target_sel" in
+        0|q|Q) rm -f "$STATE/blockcheck.domain" "$STATE/blockcheck.service"; return 1;;
+        '') target="$auto_target";;
+        *[!0-9]*) say "$(t INVALID)"; return 1;;
+        *) target="$(printf '%s\n' $valid_list | sed -n "${target_sel}p")"; [ -n "$target" ] || { say "$(t INVALID)"; return 1; };;
+    esac
     printf '%s\n' "$target" > "$STATE/blockcheck.domain"
-    t AUTO_TARGET; printf '%s\n' "$target"
+    t BC_TARGET_SELECTED; printf '%s\n' "$target"
 }
 
 # ---------- probes ----------
@@ -1431,12 +1569,12 @@ EOF2
 }
 
 tcp_probe() {
-    host="$1"; port="$2"
+    host="$1"; port="$2"; timeout_value="${3:-$TIMEOUT}"
     # zapret2 upstream explicitly prefers ncat; BusyBox nc is unsupported.
     if has ncat; then
-        ncat -z -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
+        ncat -z -w "$timeout_value" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
     elif has nc && ! nc 2>&1 | grep -qi busybox; then
-        nc -z -w "$TIMEOUT" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
+        nc -z -w "$timeout_value" "$host" "$port" >/dev/null 2>&1 && echo PASS || echo TCP_FAILURE
     else
         echo UNAVAILABLE
     fi
@@ -1738,6 +1876,7 @@ external_preflight() {
     say "curl    : $(has curl && echo AVAILABLE || echo MISSING)"
     say "jq      : $(has jq && echo AVAILABLE || echo MISSING)"
     say "dig     : $(has dig && echo AVAILABLE || echo MISSING)"
+    say "ncat    : $(has ncat && echo AVAILABLE || echo MISSING)"
     say "nc      : $(has nc && echo AVAILABLE || echo MISSING)"
     say "iperf3  : $(has iperf3 && echo AVAILABLE || echo MISSING)"
     say "ping    : $(has ping && echo AVAILABLE || echo MISSING)"
@@ -2291,7 +2430,7 @@ external_dns_transport_integrity() {
 }
 
 external_nvidia_detailed() {
-    external_check_dependencies 'NVIDIA detailed diagnostics' curl dig openssl nc || return 0
+    external_check_dependencies 'NVIDIA detailed diagnostics' curl dig openssl ncat || return 0
     rec="$(service_record NVIDIA)"
     IFS='|' read -r _ _ _ _ _ _ _ _ groups <<EOF2
 $rec
@@ -2304,7 +2443,7 @@ EOF2
             d="$1"
             ip=$(resolve_a "$d")
             [ -n "$ip" ] || { printf "|0|0|0|000"; return; }
-            tcp=0; nc -z -w 3 "$ip" 443 >/dev/null 2>&1 && tcp=1
+            tcp=0; if has ncat; then ncat -z -w 3 "$ip" 443 >/dev/null 2>&1 && tcp=1; elif has nc && ! nc 2>&1 | grep -qi busybox; then nc -z -w 3 "$ip" 443 >/dev/null 2>&1 && tcp=1; fi
             tls=0; tlsout=$(printf "" | openssl s_client -connect "$d:443" -servername "$d" -brief 2>&1 || true); echo "$tlsout" | grep -Eq "Protocol[^:]*:[[:space:]]*TLS|Protocol.*TLSv1" && tls=1
             code=$(curl -4 -sS -o /dev/null --connect-timeout 5 --max-time 10 -w "%{http_code}" "https://$d" 2>/dev/null || true); [ -n "$code" ] || code=000
             http=0; case "$code" in 2*|3*|4*|5*) http=1;; esac
@@ -2673,6 +2812,9 @@ blockcheck_summary() {
     unavailable=0
     while IFS= read -r line; do
         case "$line" in
+            *'sh: invalid number '*|*'arithmetic syntax error'*|*'Illegal number'*)
+                continue
+                ;;
             \*\ script\ :*)
                 if [ -n "$current" ]; then
                     if [ "$COLOR_ENABLED" = 1 ]; then printf "[%s %03d] %s — %s\n" "$(t STRATEGY)" "$current_idx" "$current" "$(colorize "$C_YELLOW" "$(t RESULT): $(t STRATEGY_UNAVAILABLE)")"; else say "[$(t STRATEGY) $(printf '%03d' "$current_idx")] $current — $(t STRATEGY_UNAVAILABLE)"; fi
@@ -2741,20 +2883,11 @@ blockcheck_summary() {
         say "[SUMMARY] $label: AVAILABLE=$available NOT_WORKING=$unavailable"
     fi
 }
-ask_save_blockcheck() {
+retain_blockcheck_reports() {
     pattern="$1"
-    if [ "${LANG_MODE:-RU}" = RU ]; then printf 'Сохранить raw-отчёт blockcheck? [y/N] '; else printf 'Save raw blockcheck report? [y/N] '; fi
-    read save || save=n
-    case "$save" in
-      y|Y)
-        say "[$(t TAG_SAVED)] Report remains in $BLOCKDIR"
-        ls -1t "$BLOCKDIR"/$pattern 2>/dev/null | head -n 10 || true
-        ;;
-      *)
-        for f in "$BLOCKDIR"/$pattern; do [ -f "$f" ] && rm -f "$f"; done
-        say "[$(t TAG_NOT_SAVED)] Raw blockcheck captures removed."
-        ;;
-    esac
+    say "[$(t TAG_SAVED)] Raw blockcheck reports saved automatically."
+    say "  Каталог : $BLOCKDIR"
+    ls -1t "$BLOCKDIR"/$pattern 2>/dev/null | head -n 10 || true
 }
 
 strategy_hash() {
@@ -2804,20 +2937,31 @@ kill_running() {
 
 make_target_ips() {
     : > "$RUN/target.v4"; : > "$RUN/target.v6"
-    while IFS= read -r s; do
-        rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ _ _ _ <<EOF2
-$rec
-EOF2
-        for d in $domains; do
+    if [ -n "${COMPAT_TARGETS_FILE:-}" ] && [ -s "$COMPAT_TARGETS_FILE" ]; then
+        while IFS='|' read -r _svc d; do
+            [ -n "$d" ] || continue
             resolve_ips_for_strategy "$d" | tr ' ' '\n' | while IFS= read -r ip; do
                 [ -n "$ip" ] || continue
                 case "$ip" in *:*) echo "$ip" >> "$RUN/target.v6";; *) echo "$ip" >> "$RUN/target.v4";; esac
             done
-        done
-    done < "$STATE/services.list"
+        done < "$COMPAT_TARGETS_FILE"
+    else
+        while IFS= read -r s; do
+            rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ _ _ _ <<EOF2
+$rec
+EOF2
+            for d in $domains; do
+                resolve_ips_for_strategy "$d" | tr ' ' '\n' | while IFS= read -r ip; do
+                    [ -n "$ip" ] || continue
+                    case "$ip" in *:*) echo "$ip" >> "$RUN/target.v6";; *) echo "$ip" >> "$RUN/target.v4";; esac
+                done
+            done
+        done < "$STATE/services.list"
+    fi
     sort -u "$RUN/target.v4" -o "$RUN/target.v4" 2>/dev/null || true
     sort -u "$RUN/target.v6" -o "$RUN/target.v6" 2>/dev/null || true
 }
+
 
 start_candidate_fw_nft() {
     has nft || return 1
@@ -2889,11 +3033,10 @@ test_domain_set() {
     case "$FWTYPE" in nftables) start_candidate_fw_nft;; *) start_candidate_fw_iptables;; esac || return 1
     start_worker "$engine" "$args" || { cleanup_ours; return 1; }; sleep "$WAIT_AFTER_RESTART"
     pass=0; total=0; untested=0; : > "$RUN/current-results"
-    while IFS= read -r s; do
-        rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ htt https quic <<EOF2
-$rec
-EOF2
-        for d in $domains; do
+    if [ -n "${COMPAT_TARGETS_FILE:-}" ] && [ -s "$COMPAT_TARGETS_FILE" ]; then
+        while IFS='|' read -r s d; do
+            [ -n "$d" ] || continue
+            htt=0; https=1; quic=0
             a=1
             while [ "$a" -le "$attempts" ]; do
                 dns="$(dns_probe "$d" 2>/dev/null || true)"; resolve_ip=""
@@ -2904,18 +3047,43 @@ EOF2
                 if [ -z "$resolve_ip" ] || is_synthetic_ip "$resolve_ip"; then
                     untested=$((untested+1)); echo "$s|$d|${dns:-NO_DATA}|NA|NA|NA" >> "$RUN/current-results"; a=$((a+1)); continue
                 fi
-                total=$((total+1)); http="NA"; httpsr="NA"; h3="NA"; curl_resolve="--resolve ${d}:80:${resolve_ip} --resolve ${d}:443:${resolve_ip}"
-                [ "$htt" = 1 ] && http="$(curl_probe "http://$d" "$curl_resolve")"
-                [ "$https" = 1 ] && httpsr="$(curl_probe "https://$d" "$curl_resolve")"
-                [ "$ENABLE_HTTP3" = 1 ] && [ "$quic" = 1 ] && { if http3_capable; then h3="$(curl_probe "https://$d" "$curl_resolve --http3-only")"; else h3='2|UNAVAILABLE|0|NA|'; fi; }
-                echo "$s|$d|$dns|$http|$httpsr|$h3" >> "$RUN/current-results"
+                total=$((total+1)); curl_resolve="--resolve ${d}:443:${resolve_ip}"
+                httpsr="$(curl_probe "https://$d" "$curl_resolve")"
+                echo "$s|$d|$dns|NA|$httpsr|NA" >> "$RUN/current-results"
                 case "$httpsr" in *'|PASS|'*|0'|PASS|'*) pass=$((pass+1));; esac
                 a=$((a+1))
             done
-        done
-    done < "$STATE/services.list"
+        done < "$COMPAT_TARGETS_FILE"
+    else
+        while IFS= read -r s; do
+            rec="$(service_record "$s")"; IFS='|' read -r _ _ domains _ _ htt https quic <<EOF2
+$rec
+EOF2
+            for d in $domains; do
+                a=1
+                while [ "$a" -le "$attempts" ]; do
+                    dns="$(dns_probe "$d" 2>/dev/null || true)"; resolve_ip=""
+                    case "$dns" in
+                        PASS\|*) resolve_ip="$(printf '%s' "$dns" | cut -d'|' -f2)";;
+                        DNS_SYNTHETIC*|DNS_FAILURE*) doh_result="$(dns_integrity_probe "$d" 2>/dev/null || true)"; resolve_ip="$(printf '%s' "$doh_result" | cut -d'|' -f4)"; [ -n "$resolve_ip" ] && dns="PASS|$resolve_ip|DOH";;
+                    esac
+                    if [ -z "$resolve_ip" ] || is_synthetic_ip "$resolve_ip"; then
+                        untested=$((untested+1)); echo "$s|$d|${dns:-NO_DATA}|NA|NA|NA" >> "$RUN/current-results"; a=$((a+1)); continue
+                    fi
+                    total=$((total+1)); http="NA"; httpsr="NA"; h3="NA"; curl_resolve="--resolve ${d}:80:${resolve_ip} --resolve ${d}:443:${resolve_ip}"
+                    [ "$htt" = 1 ] && http="$(curl_probe "http://$d" "$curl_resolve")"
+                    [ "$https" = 1 ] && httpsr="$(curl_probe "https://$d" "$curl_resolve")"
+                    [ "$ENABLE_HTTP3" = 1 ] && [ "$quic" = 1 ] && { if http3_capable; then h3="$(curl_probe "https://$d" "$curl_resolve --http3-only")"; else h3='2|UNAVAILABLE|0|NA|'; fi; }
+                    echo "$s|$d|$dns|$http|$httpsr|$h3" >> "$RUN/current-results"
+                    case "$httpsr" in *'|PASS|'*|0'|PASS|'*) pass=$((pass+1));; esac
+                    a=$((a+1))
+                done
+            done
+        done < "$STATE/services.list"
+    fi
     kill_running; cleanup_ours; printf '%s|%s|%s\n' "$pass" "$total" "$untested"
 }
+
 
 control_test() {
     strategy="$1"; args="$2"; engine="$3"
@@ -2946,8 +3114,89 @@ score_result() {
     echo "$base"
 }
 
+save_verified_strategy() {
+    engine="$1"; id="$2"; args="$3"; score="$4"; source_service="$5"; source_domain="$6"; pass="$7"; total="$8"; side="$9"; untested="${10}"; status_value="${11}"
+    [ "$status_value" = PASS ] || return 0
+    [ "$side" -eq 0 ] || return 0
+    [ "$untested" -eq 0 ] || return 0
+    mkdir -p "$WORKING_STRATEGY_DIR" 2>/dev/null || return 1
+    hash="$(printf '%s' "$engine|$args" | sha256sum 2>/dev/null | awk '{print $1}' | cut -c1-16)"
+    [ -n "$hash" ] || hash="$(printf '%s' "$engine|$id|$args" | cksum | awk '{print $1}')"
+    file="$WORKING_STRATEGY_DIR/${engine}-${hash}.strategy"
+    {
+        printf 'ENGINE=%s\n' "$engine"
+        printf 'ID=%s\n' "$id"
+        printf 'SCORE=%s\n' "$score"
+        printf 'PASS=%s\n' "$pass"
+        printf 'TOTAL=%s\n' "$total"
+        printf 'SIDE_EFFECT=%s\n' "$side"
+        printf 'SOURCE_SERVICE=%s\n' "$source_service"
+        printf 'SOURCE_DOMAIN=%s\n' "$source_domain"
+        printf 'SAVED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+        printf 'ARGS=%s\n' "$args"
+    } > "$file"
+    tmp_index="$WORKING_STRATEGY_DIR/index.tmp"
+    if [ -f "$WORKING_STRATEGY_DIR/index.tsv" ]; then
+        awk -F'|' -v e="$engine" -v h="$hash" '$1!=e || $3!=h' "$WORKING_STRATEGY_DIR/index.tsv" > "$tmp_index" 2>/dev/null || : > "$tmp_index"
+    else
+        : > "$tmp_index"
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$engine" "$id" "$hash" "$score" "$source_service" "$source_domain" "$pass/$total" "$args" >> "$tmp_index"
+    mv "$tmp_index" "$WORKING_STRATEGY_DIR/index.tsv"
+    say "[$(t STRATEGY)] $id → $(t STATUS_PASS): сохранено $file"
+}
+
+save_blockcheck_available_candidates() {
+    engine="$1"; raw="$2"; source_service="$(cat "$STATE/blockcheck.service" 2>/dev/null || true)"; source_domain="$(cat "$STATE/blockcheck.domain" 2>/dev/null || true)"
+    [ -s "$raw" ] || return 0
+    mkdir -p "$WORKING_STRATEGY_DIR" 2>/dev/null || return 1
+    candidate_count=0
+    current=""
+    while IFS= read -r line; do
+        case "$line" in
+            -*\ curl_test_*:\ *)
+                current="${line#*: }"
+                ;;
+            *'!!!!! AVAILABLE !!!!!'*)
+                [ -n "$current" ] || continue
+                hash="$(printf '%s' "$engine|$current" | sha256sum 2>/dev/null | awk '{print $1}' | cut -c1-16)"
+                [ -n "$hash" ] || hash="$(printf '%s' "$engine|$current" | cksum | awk '{print $1}')"
+                file="$WORKING_STRATEGY_DIR/${engine}-${hash}.candidate"
+                {
+                    printf 'TYPE=CANDIDATE\n'
+                    printf 'ENGINE=%s\n' "$engine"
+                    printf 'SOURCE_SERVICE=%s\n' "$source_service"
+                    printf 'SOURCE_DOMAIN=%s\n' "$source_domain"
+                    printf 'STATUS=AVAILABLE\n'
+                    printf 'SAVED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || true)"
+                    printf 'ARGS=%s\n' "$current"
+                } > "$file"
+                candidate_count=$((candidate_count+1))
+                current=""
+                ;;
+            *'!!!! MATCHING !!!!!!'*|*'UNAVAILABLE code='*)
+                current=""
+                ;;
+        esac
+    done < "$raw"
+    if [ "$candidate_count" -gt 0 ]; then
+        say "[$(t STRATEGY)] Найдено кандидатов blockcheck: $candidate_count"
+        say "  Кандидаты сохранены в: $WORKING_STRATEGY_DIR"
+    fi
+    return 0
+}
+
+list_working_strategy_files() {
+    mkdir -p "$WORKING_STRATEGY_DIR" 2>/dev/null || true
+    find "$WORKING_STRATEGY_DIR" -maxdepth 1 -type f -name '*.strategy' -print 2>/dev/null | sort
+}
+
 run_strategy_tests() {
     engine="$1"; db="$2"; attempts="$3"
+    # Never verify candidates from an interrupted/partial blockcheck.
+    [ "${BLOCKCHECK_INTERRUPTED:-0}" -eq 0 ] || return 130
+    [ -f "$db" ] || return 1
+    [ -s "$db" ] || return 0
     [ -f "$RUN/strategy-results" ] || : > "$RUN/strategy-results"
     n=0
     STRATEGY_INTERRUPTED=0
@@ -3016,6 +3265,11 @@ run_strategy_tests() {
         score="$(score_result "$pass" "$total" 0 "$side" "$elapsed")"
         status2=FAIL; [ "$pass" -gt 0 ] && status2=PARTIAL; [ "$pass" -ge "$total" ] && [ "$total" -gt 0 ] && status2=PASS
         printf '%s|%s|%s|%s|%s|%s|%s\n' "$id" "$engine" "$args" "$status2" "$score" "$pass/$total" "$side" >> "$RUN/strategy-results"
+        if [ "$status2" = PASS ]; then
+            source_service="$(cat "$STATE/blockcheck.service" 2>/dev/null || true)"
+            source_domain="$(cat "$STATE/blockcheck.domain" 2>/dev/null || true)"
+            save_verified_strategy "$engine" "$id" "$args" "$score" "$source_service" "$source_domain" "$pass" "$total" "$side" "$untested" "$status2" || true
+        fi
         if [ "$COLOR_ENABLED" = 1 ]; then
             display_status="$status2"
             if [ "${LANG_MODE:-RU}" = RU ]; then
@@ -3057,6 +3311,7 @@ timeout_run() { internal_timeout "$STRATEGY_TIMEOUT" "$@"; }
 run_engine_blockcheck() {
     engine="$1"
     namespace="${2:-S}"
+    BLOCKCHECK_INTERRUPTED=0
     if [ -s "$STATE/blockcheck.domain" ]; then
         all="$(cat "$STATE/blockcheck.domain" 2>/dev/null)"
     else
@@ -3074,16 +3329,24 @@ run_engine_blockcheck() {
       ZAPRET2) [ -n "$BLOCKCHECK2" ] || return 1; run_blockcheck ZAPRET2 "$all" "$BLOCKCHECK_SCANLEVEL"; run_rc=$?;;
       *) return 1;;
     esac
-    # Never parse/generate candidate databases after an interrupted or failed
-    # upstream blockcheck. This is what previously caused Sxxxx output after ^C.
-    case "$run_rc" in
-        130|143) return "$run_rc";;
-        0) :;;
-        *) return "$run_rc";;
-    esac
     case "$engine" in
       ZAPRET) raw="$BLOCKDIR/blockcheck-latest.txt";;
       ZAPRET2) raw="$BLOCKDIR/blockcheck2-latest.txt";;
+    esac
+    # Never parse/generate verification candidate databases after an interrupted or failed
+    # upstream blockcheck. Preserve only upstream AVAILABLE candidates for later inspection.
+    case "$run_rc" in
+        130|143)
+            BLOCKCHECK_INTERRUPTED=1
+            save_blockcheck_available_candidates "$engine" "$raw" || true
+            return "$run_rc"
+            ;;
+        0) BLOCKCHECK_INTERRUPTED=0;;
+        *)
+            BLOCKCHECK_INTERRUPTED=0
+            save_blockcheck_available_candidates "$engine" "$raw" || true
+            return "$run_rc"
+            ;;
     esac
     [ -f "$raw" ] || return 1
     if ! grep -Eq '\* script :|!!!!! AVAILABLE !!!!!|UNAVAILABLE code=' "$raw" 2>/dev/null; then
@@ -3214,6 +3477,139 @@ show_detect() {
 
 # ---------- interactive UI ----------
 
+compat_read_field() {
+    file="$1"; key="$2"
+    sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -n1
+}
+
+compat_service_menu() {
+    parse_services > "$RUN/compat-service-source"
+    i=1; : > "$RUN/compat-service-menu"
+    while IFS='|' read -r svc desc dom tcp udp ht hts q groups; do
+        [ -n "$svc" ] || continue
+        printf '[%d] %s\n' "$i" "$svc"
+        printf '%d|%s\n' "$i" "$svc" >> "$RUN/compat-service-menu"
+        i=$((i+1))
+    done < "$RUN/compat-service-source"
+}
+
+compat_select_domains() {
+    svc="$1"; all_domains="$2"
+    say ""
+    say "$(t BC_COMPAT_TARGET_MODE)"
+    say "[1] $(t BC_COMPAT_ALL)"
+    say "[2] $(t BC_COMPAT_SELECT)"
+    say "[0] $(t BACK)"
+    t SELECT; read mode || mode=''
+    case "$mode" in
+        0|q|Q) return 1;;
+        1) : > "$RUN/compat-targets"; for d in $all_domains; do printf '%s|%s\n' "$svc" "$d" >> "$RUN/compat-targets"; done;;
+        2)
+            i=0; : > "$RUN/compat-target-menu"
+            say "TARGETS: $svc"
+            for d in $all_domains; do i=$((i+1)); printf '  [%02d] %s\n' "$i" "$d"; printf '%d|%s\n' "$i" "$d" >> "$RUN/compat-target-menu"; done
+            printf 'Домены (например 1,3,5): '; read picks || picks=''
+            : > "$RUN/compat-targets"
+            oldifs="$IFS"; IFS=','
+            for n in $picks; do
+                n="$(printf '%s' "$n" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+                d="$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/compat-target-menu")"
+                [ -n "$d" ] && printf '%s|%s\n' "$svc" "$d" >> "$RUN/compat-targets"
+            done
+            IFS="$oldifs"
+            [ -s "$RUN/compat-targets" ] || return 1
+            ;;
+        *) return 1;;
+    esac
+}
+
+run_saved_strategy_compat() {
+    file="$1"; n="$2"
+    engine="$(compat_read_field "$file" ENGINE)"; id="$(compat_read_field "$file" ID)"; args="$(compat_read_field "$file" ARGS)"
+    [ -n "$engine" ] && [ -n "$args" ] || return 1
+    case "$engine" in ZAPRET) [ -n "${NFQWS:-}" ] || return 1;; ZAPRET2) [ -n "${NFQWS2:-}" ] || return 1;; *) return 1;; esac
+    result_file="$RUN/compat-${n}.result"; start=$(now_ms)
+    COMPAT_TARGETS_FILE="$RUN/compat-targets" timeout_run test_domain_set "$engine" "$args" "$COMPAT_ATTEMPTS" "$id" > "$result_file" 2>&1
+    rc=$?; end=$(now_ms); elapsed=$((end-start))
+    result="$(cat "$result_file" 2>/dev/null || true)"
+    pass="$(printf '%s\n' "$result" | awk -F'|' '{print $1}' | tail -n1)"; total="$(printf '%s\n' "$result" | awk -F'|' '{print $2}' | tail -n1)"; untested="$(printf '%s\n' "$result" | awk -F'|' '{print $3}' | tail -n1)"
+    case "$pass" in ''|*[!0-9]*) pass=0;; esac; case "$total" in ''|*[!0-9]*) total=0;; esac; case "$untested" in ''|*[!0-9]*) untested=0;; esac
+    side=0; status=SKIPPED; score=0
+    if [ "$rc" -eq 0 ]; then
+        side="$(control_test "$id" "$args" "$engine")"; [ -n "$side" ] || side=0
+        score="$(score_result "$pass" "$total" 0 "$side" "$elapsed")"
+        status=FAIL; [ "$pass" -gt 0 ] && status=PARTIAL; [ "$total" -gt 0 ] && [ "$pass" -ge "$total" ] && status=PASS
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$id" "$engine" "$status" "$score" "$pass/$total" "$untested" "$side" "$file" >> "$RUN/compatibility-results.tsv"
+    printf '%-14s %-11s score=%-3s pass=%s elapsed=%sms untested=%s\n' "$id" "$status" "$score" "$pass/$total" "$elapsed" "$untested"
+    rm -f "$result_file"
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]
+}
+
+ui_strategy_compatibility() {
+    ensure_default_files; load_config; detect_system; detect_zapret; detect_zapret2; report_init
+    files="$(list_working_strategy_files)"
+    [ -n "$files" ] || { say "$(t BC_COMPAT_NONE)"; return 0; }
+    count="$(printf '%s\n' "$files" | sed '/^$/d' | wc -l | tr -d ' ')"
+    say "$(t BC_COMPAT_COUNT)$count"
+    say "Сохранённые стратегии: $WORKING_STRATEGY_DIR"
+    say "[1] $(t BC_COMPAT_ORIGINAL)"
+    say "[2] $(t BC_COMPAT_OTHER)"
+    say "[0] $(t BACK)"
+    t SELECT; read source_mode || source_mode=''
+    case "$source_mode" in 0|q|Q) return 0;; 1) ;; 2) ;; *) say "$(t INVALID)"; return 1;; esac
+    if [ "$source_mode" = 1 ]; then
+        : > "$RUN/compat-source-services"
+        while IFS= read -r file; do
+            svc0="$(compat_read_field "$file" SOURCE_SERVICE)"
+            [ -n "$svc0" ] || continue
+            printf '%s\n' "$svc0" >> "$RUN/compat-source-services"
+        done <<EOF2
+$files
+EOF2
+        sort -u "$RUN/compat-source-services" -o "$RUN/compat-source-services" 2>/dev/null || true
+        source_count="$(wc -l < "$RUN/compat-source-services" 2>/dev/null | tr -d ' ')"
+        if [ "$source_count" = 1 ]; then
+            svc="$(head -n1 "$RUN/compat-source-services")"
+        else
+            i=1; : > "$RUN/compat-source-menu"
+            say "Сервисы, для которых найдены сохранённые стратегии:"
+            while IFS= read -r svc0; do
+                printf '  [%d] %s\n' "$i" "$svc0"
+                printf '%d|%s\n' "$i" "$svc0" >> "$RUN/compat-source-menu"
+                i=$((i+1))
+            done < "$RUN/compat-source-services"
+            t SELECT_BC_SERVICE; read n || n=''
+            svc="$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/compat-source-menu")"
+        fi
+    else
+        compat_service_menu
+        t SELECT_BC_SERVICE; read n || n=''
+        svc="$(awk -F'|' -v n="$n" '$1==n{print $2; exit}' "$RUN/compat-service-menu")"
+    fi
+    [ -n "$svc" ] || { say "$(t INVALID)"; return 1; }
+    domains="$(get_valid_service_domains "$svc")"
+    [ -n "$domains" ] || { t NO_VALID_BC_DOMAINS; return 1; }
+    compat_select_domains "$svc" "$domains" || { say "$(t INVALID)"; return 1; }
+    : > "$RUN/compatibility-results.tsv"
+    COMPAT_TARGETS_FILE="$RUN/compat-targets"
+    backup_create
+    stop_engine_services || { COMPAT_TARGETS_FILE=""; say 'failed to stop installed services'; return 1; }
+    say ""; say "$(t BC_COMPAT_RUNNING)"; say "  Service: $svc"
+    n=0
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        n=$((n+1))
+        run_saved_strategy_compat "$file" "$n" || { rc=$?; [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ] && break; }
+    done <<EOF2
+$files
+EOF2
+    COMPAT_TARGETS_FILE=""
+    restore_all || { ROLLBACK_OK=0; say 'CRITICAL: service restore failed'; }
+    say ""; say "$(t BC_COMPAT_RESULT): $RUN/compatibility-results.tsv"
+    [ -s "$RUN/compatibility-results.tsv" ] && sort -t'|' -k4,4nr "$RUN/compatibility-results.tsv" | awk -F'|' '{printf "  %-14s %-8s SCORE=%-3s PASS=%-7s UNTESTED=%-3s SIDE=%s\n",$1,$3,$4,$5,$6,$7}'
+}
+
 ui_blockcheck_menu() {
     while :; do
         clear 2>/dev/null || true
@@ -3223,12 +3619,14 @@ ui_blockcheck_menu() {
         say "[1] $(t BC1)"
         say "[2] $(t BC2)"
         say "[3] $(t BCBOTH)"
+        say "[4] $(t BC_COMPAT)"
         say "[0] $(t BACK)"
         t SELECT; read e || return 0
         case "$e" in
             1) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck1; ui_pause;;
             2) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck2; ui_pause;;
             3) select_blockcheck_target || { ui_pause; continue; }; cmd_blockcheck; ui_pause;;
+            4) ui_strategy_compatibility; ui_pause;;
             0|q|Q) return 0;;
             *) say "$(t INVALID)"; ui_pause;;
         esac
@@ -3405,12 +3803,12 @@ cmd_blockcheck_engine() {
     run_engine_blockcheck "$engine"
     run_rc=$?
     restore_all || { ROLLBACK_OK=0; say 'CRITICAL: service restore failed'; return 1; }
-    [ "$run_rc" -eq 130 ] && { say '[INTERRUPTED] Blockcheck stopped by user.'; finalize_report; return 130; }
-    [ "$run_rc" -ne 0 ] && { say "Could not run $engine blockcheck."; return "$run_rc"; }
+    [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ] && { BLOCKCHECK_INTERRUPTED=1; say '[INTERRUPTED] Blockcheck stopped by user.'; finalize_report; say "Raw blockcheck: $BLOCKDIR"; say "Report: $REPORT_TXT"; return 130; }
+    [ "$run_rc" -ne 0 ] && { BLOCKCHECK_INTERRUPTED=0; say "Could not run $engine blockcheck."; return "$run_rc"; }
     finalize_report
     say "Blockcheck results directory: $BLOCKDIR"
     ls -1t "$BLOCKDIR"/blockcheck*.txt 2>/dev/null | head -n 5 || true
-    ask_save_blockcheck "blockcheck*.txt"
+    retain_blockcheck_reports "blockcheck*.txt"
 }
 
 cmd_blockcheck1() { cmd_blockcheck_engine ZAPRET; }
@@ -3427,6 +3825,7 @@ cmd_blockcheck() {
             ZAPRET2) [ -n "${BLOCKCHECK2:-}" ] || continue;;
         esac
         any=1
+        BLOCKCHECK_INTERRUPTED=0
         run_engine_blockcheck "$e" S
         run_rc=$?
         if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
@@ -3438,13 +3837,15 @@ cmd_blockcheck() {
     if [ "${interrupted:-0}" = 1 ]; then
         restore_all || { ROLLBACK_OK=0; }
         finalize_report
+        say "Raw blockcheck: $BLOCKDIR"
+        say "Report: $REPORT_TXT"
         return 130
     fi
     restore_all || { ROLLBACK_OK=0; say 'CRITICAL: service restore failed'; return 1; }
     finalize_report
     say "Blockcheck results directory: $BLOCKDIR"
     ls -1t "$BLOCKDIR"/blockcheck*.txt 2>/dev/null | head -n 10 || true
-    ask_save_blockcheck "blockcheck*.txt"
+    retain_blockcheck_reports "blockcheck*.txt"
 }
 
 engines_to_test() {
@@ -3470,6 +3871,7 @@ cmd_test() {
     for e in $(engines_to_test); do
         db="$BLOCKDIR/${e}.db"
         rm -f "$db" "$BLOCKDIR/${e}.candidates"
+        BLOCKCHECK_INTERRUPTED=0
         run_engine_blockcheck "$e" S
         run_rc=$?
         if [ "$run_rc" -eq 130 ] || [ "$run_rc" -eq 143 ]; then
@@ -3484,6 +3886,8 @@ cmd_test() {
     if [ "$test_interrupted" = 1 ]; then
         say "[$(t TAG_STOP)] Test chain interrupted; candidate verification was not started on partial blockcheck data."
         finalize_report
+        say "Raw blockcheck: $BLOCKDIR"
+        say "Report: $REPORT_TXT"
         return 130
     fi
     finalize_report
@@ -3517,7 +3921,7 @@ cmd_auto() {
           break
       fi
       [ "$run_rc" -eq 0 ] || continue
-      [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
+      [ "${BLOCKCHECK_INTERRUPTED:-0}" -eq 0 ] && [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
     done
     restore_all || { ROLLBACK_OK=0; say 'CRITICAL: rollback failed'; }
     if [ "${interrupted:-0}" = 1 ]; then
@@ -3550,7 +3954,7 @@ cmd_debug() {
             break
         fi
         [ "$run_rc" -eq 0 ] || continue
-        [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
+        [ "${BLOCKCHECK_INTERRUPTED:-0}" -eq 0 ] && [ -s "$db" ] && run_strategy_tests "$e" "$db" "${ATTEMPTS:-3}" || true
     done
     restore_all || { ROLLBACK_OK=0; }
     finalize_report
@@ -3684,6 +4088,7 @@ $NAME <command>
   blockcheck   запустить доступные blockcheck для автоматически выбранного target
   blockcheck1  запустить только blockcheck.sh
   blockcheck2  запустить только blockcheck2.sh
+  compatibility проверить сохранённые рабочие стратегии на выбранных доменах
   quick        baseline -> quick blockcheck -> проверка стратегий -> restore -> отчёт
   full         baseline -> full blockcheck -> проверка стратегий -> restore -> отчёт
   auto         baseline -> standard blockcheck для найденных движков -> анализ кандидатов -> restore -> отчёт
@@ -3774,6 +4179,7 @@ main() {
       blockcheck) cmd_blockcheck;;
       blockcheck1) cmd_blockcheck1;;
       blockcheck2) cmd_blockcheck2;;
+      compatibility) ui_strategy_compatibility;;
       quick) cmd_quick;;
       full) cmd_full;;
       auto) cmd_auto;;

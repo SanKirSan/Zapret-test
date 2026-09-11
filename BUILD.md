@@ -21,7 +21,7 @@ make check
 Версию задают одновременно в `VERSION`, `RELEASE` и `zapret-test`:
 
 ```sh
-make VERSION=0.6.6.6
+make VERSION=0.6.6.9
 ```
 
 Для интеграции в CI используйте:
@@ -55,7 +55,7 @@ The resulting archive is `zapret-test-VERSION.zip` and contains exactly one top-
 Set the release version consistently with:
 
 ```sh
-make VERSION=0.6.6.6
+make VERSION=0.6.6.9
 ```
 
 For CI:
