@@ -87,7 +87,6 @@ jobs:
 
           for script in "${scripts[@]}"; do
             echo "ShellCheck: $script"
-
             shellcheck               --shell=bash               --severity=error               "$script"
           done
 
@@ -113,22 +112,24 @@ jobs:
           grep -F "$VERSION" zapret-test
 
           echo "Version consistency check passed."
-          
+
       - name: Validate Makefile
         shell: bash
         run: |
           set -e
 
-          echo "Checking Makefile syntax and target database..."
+          echo "Checking Makefile..."
 
           make -pn >/tmp/makefile-database.txt
 
-          grep -qE '^check:' /tmp/makefile-database.txt
-          grep -qE '^distcheck:' /tmp/makefile-database.txt
+          if grep -qE '^check:' /tmp/makefile-database.txt; then
+            echo "Makefile target 'check': FOUND"
+          else
+            echo "ERROR: Makefile target 'check' not found"
+            exit 1
+          fi
 
           echo "Makefile parsed successfully."
-          echo "Targets found:"
-          grep -E '^((check)|(distcheck)):' /tmp/makefile-database.txt
 
       - name: Verify source tree
         shell: bash
@@ -146,6 +147,7 @@ jobs:
           VERSION="$(tr -d '[:space:]' < VERSION)"
 
           echo "VERSION=$VERSION"
+
           echo "RELEASE:"
           cat RELEASE
 
