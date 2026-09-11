@@ -7,7 +7,6 @@ set -eu
 REPO="${ZAPRET_TEST_REPO:-SanKirSan/Zapret-test}"
 REF="${ZAPRET_TEST_REF:-main}"
 ARCHIVE_URL="${ZAPRET_TEST_ARCHIVE_URL:-https://github.com/$REPO/archive/refs/heads/$REF.tar.gz}"
-BASE="${ZAPRET_TEST_BASE_URL:-https://raw.githubusercontent.com/$REPO/$REF}"
 
 TMP_ROOT="${TMPDIR:-/tmp}/zapret-test-bootstrap.$$"
 cleanup(){ rm -rf "$TMP_ROOT"; }
@@ -15,13 +14,19 @@ trap cleanup EXIT INT TERM
 mkdir -p "$TMP_ROOT"
 
 printf '%s\n' "Downloading zapret-test from $REPO ($REF)..."
+
+# Build the raw GitHub base only where it is used.
+# Do not keep a separate BASE variable: older bootstrap revisions could
+# reference BASE before initialization when executed with `set -u`.
+RAW_BASE="https://raw.githubusercontent.com/$REPO/$REF"
+
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 --connect-timeout 8 --max-time 60 "$BASE/install.sh" -o "$TMP_ROOT/install.sh" || exit 1
-    curl -fsSL --retry 2 --connect-timeout 8 --max-time 60 "$BASE/build.sh" -o "$TMP_ROOT/build.sh" || true
+    curl -fsSL --retry 2 --connect-timeout 8 --max-time 60 "$RAW_BASE/install.sh" -o "$TMP_ROOT/install.sh" || exit 1
+    curl -fsSL --retry 2 --connect-timeout 8 --max-time 60 "$RAW_BASE/build.sh" -o "$TMP_ROOT/build.sh" || true
 else
     command -v wget >/dev/null 2>&1 || { echo 'ERROR: curl or wget is required.' >&2; exit 2; }
-    wget -q -O "$TMP_ROOT/install.sh" "$BASE/install.sh" || exit 1
-    wget -q -O "$TMP_ROOT/build.sh" "$BASE/build.sh" || true
+    wget -q -O "$TMP_ROOT/install.sh" "$RAW_BASE/install.sh" || exit 1
+    wget -q -O "$TMP_ROOT/build.sh" "$RAW_BASE/build.sh" || true
 fi
 
 # The normal installer expects the full source tree.
