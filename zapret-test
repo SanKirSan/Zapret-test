@@ -3471,7 +3471,19 @@ show_detect() {
     say "$(t ZAPRET2_VERSION) : $ZAPRET2_VERSION"
     say "DNS             : ${DNS_SERVERS:-UNAVAILABLE}"
     say "curl            : $($CURL --version 2>/dev/null | head -n1)"
-    if http3_capable; then if [ "${LANG_MODE:-RU}" = RU ]; then say 'HTTP/3 у curl    : ДОСТУПЕН'; else say 'curl HTTP/3     : AVAILABLE'; fi; else if [ "${LANG_MODE:-RU}" = RU ]; then say 'HTTP/3 у curl    : НЕДОСТУПЕН'; else say 'curl HTTP/3     : UNAVAILABLE'; fi; fi
+    if http3_capable; then
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        say 'HTTP/3 у curl    : ДОСТУПЕН'
+    else
+        say 'curl HTTP/3     : AVAILABLE'
+    fi
+else
+    if [ "${LANG_MODE:-RU}" = RU ]; then
+        say 'HTTP/3 у curl    : НЕДОСТУПЕН'
+    else
+        say 'curl HTTP/3     : UNAVAILABLE'
+    fi
+fi
 }
 
 
