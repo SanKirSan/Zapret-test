@@ -113,7 +113,7 @@ jobs:
           grep -F "$VERSION" zapret-test
 
           echo "Version consistency check passed."
-
+          
       - name: Validate Makefile
         shell: bash
         run: |
@@ -121,14 +121,14 @@ jobs:
 
           echo "Checking Makefile syntax and target database..."
 
-          make -qp >/tmp/makefile-database.txt
+          make -pn >/tmp/makefile-database.txt
 
-          grep -q '^check:' Makefile
-          grep -q '^distcheck:' Makefile
+          grep -qE '^check:' /tmp/makefile-database.txt
+          grep -qE '^distcheck:' /tmp/makefile-database.txt
 
           echo "Makefile parsed successfully."
           echo "Targets found:"
-          grep -E '^(check|distcheck):' Makefile
+          grep -E '^((check)|(distcheck)):' /tmp/makefile-database.txt
 
       - name: Verify source tree
         shell: bash
