@@ -7,6 +7,7 @@ set -eu
 REPO="${ZAPRET_TEST_REPO:-SanKirSan/Zapret-test}"
 REF="${ZAPRET_TEST_REF:-main}"
 ARCHIVE_URL="${ZAPRET_TEST_ARCHIVE_URL:-https://github.com/$REPO/archive/refs/heads/$REF.tar.gz}"
+BASE="${ZAPRET_TEST_BASE_URL:-https://raw.githubusercontent.com/$REPO/$REF}"
 
 TMP_ROOT="${TMPDIR:-/tmp}/zapret-test-bootstrap.$$"
 cleanup(){ rm -rf "$TMP_ROOT"; }
